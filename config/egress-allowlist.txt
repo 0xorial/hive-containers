@@ -1,0 +1,40 @@
+# hive egress allowlist — curated by hand, applied by the bridge proxy.
+#
+# Every outbound connection from every hive container goes through the bridge
+# (tinyproxy on http://bridge:3128). Anything not listed here is refused.
+#
+# Syntax (one entry per line):
+#   example.com          allow this domain and all of its subdomains
+#   ~regex               raw ERE matched against the hostname (advanced)
+#   @connect-port 8443   additionally allow HTTPS CONNECT to this port (443 is always allowed)
+#   *                    disable filtering entirely (open egress) — use deliberately
+#
+# Apply changes with:  hive bridge reload
+
+# --- Anthropic / Claude Code ---
+anthropic.com
+api.anthropic.com
+claude.ai
+console.anthropic.com
+platform.claude.com
+statsig.anthropic.com
+statsig.com
+sentry.io
+
+# --- package registries ---
+registry.npmjs.org
+pypi.org
+files.pythonhosted.org
+
+# --- git hosting ---
+github.com
+api.github.com
+codeload.github.com
+objects.githubusercontent.com
+raw.githubusercontent.com
+gist.githubusercontent.com
+ghcr.io
+
+# --- debian packages (apt inside nodes) ---
+deb.debian.org
+security.debian.org

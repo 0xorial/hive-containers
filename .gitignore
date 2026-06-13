@@ -1,0 +1,5 @@
+# runtime state, not configuration
+config/open-nodes
+
+# macOS
+.DS_Store
