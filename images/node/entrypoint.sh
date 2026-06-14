@@ -101,6 +101,14 @@ EOF
     usermod -aG "$grp" dev
   fi
 
+  # --dind: start a nested docker engine (the dev image has dockerd; needs
+  # --privileged). dev is already in the docker group via the image.
+  if [ "${HIVE_DIND:-}" = 1 ] && command -v dockerd >/dev/null 2>&1; then
+    echo "node: starting nested dockerd (dind)…"
+    rm -f /var/run/docker.pid
+    setsid dockerd >/var/log/dockerd.log 2>&1 < /dev/null &
+  fi
+
   exec gosu dev "$@"
 fi
 

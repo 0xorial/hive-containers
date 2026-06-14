@@ -186,6 +186,33 @@ directory is your hive checkout, so deploy one-liners are short.
 > token that lives only inside blessed nodes, and bound to loopback — but treat
 > any `host on` node as fully trusted, and `host off` it when you're done.
 
+## Develop hive inside hive (nested Docker)
+
+To work on container tooling — hive itself, say — inside a node, give it a real
+nested Docker engine:
+
+```sh
+hive new hivedev --bind ~/hive-containers --dind   # a node with its own dockerd
+hive hivedev sh 'docker run --rm hello-world'      # runs in the nested engine
+```
+
+`--dind` uses the `hive/dev` image (Claude tools + a full Docker engine), runs
+the node `--privileged`, and starts `dockerd` inside it with `/var/lib/docker`
+on a dedicated volume so `overlay2` works (no overlay-on-overlay). The nested
+engine pulls through the bridge, so `hive hivedev net on` first if it needs
+images from outside the allowlist.
+
+Like the other switches it's also a live per-node toggle — but because
+`--privileged` is a creation-time capability, `hive <node> dind on/off`
+**recreates** the node (transparently preserving its workspace and its
+net/github/host state). This is the one switch that recreates rather than
+flips in place. It's `--privileged` under runc today; under Kata the micro-VM
+provides the isolation and the same setup applies unchanged.
+
+The intended loop: develop hive in the node → `git push` → `host "cd
+~/hive-containers && git pull && hive build && hive up"` to redeploy the hive
+running on your Mac.
+
 ## Claude desktop app
 
 The desktop app's SSH sessions run entirely inside a node while the app is
@@ -314,6 +341,6 @@ a Qubes-style network VM."
 bin/hive                    the CLI (symlinked into root via /workspace)
 compose.yaml                root + bridge + networks + volumes
 config/                     ← the two files you curate
-images/{node,root,bridge}/  Dockerfiles + entrypoints
+images/{node,root,bridge,dev}/  Dockerfiles + entrypoints (dev = --dind)
 templates/devcontainer/     what `hive devcontainer` installs
 ```

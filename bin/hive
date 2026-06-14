@@ -8,6 +8,7 @@ UPLINK=hive-uplink
 PROXY=http://bridge:3128
 NO_PROXY_LIST=localhost,127.0.0.1,bridge
 NODE_IMAGE=${HIVE_NODE_IMAGE:-hive/node}
+DEV_IMAGE=${HIVE_DEV_IMAGE:-hive/dev}
 HOSTD_TOKEN_FILE="$HOME/.config/hive/hostd-token"
 HOSTD_PORT=8765                                   # node-facing port on the bridge (inside hive-net)
 HOSTD_MAC_PORT=${HIVE_HOSTD_MAC_PORT:-8799}       # the Mac daemon's port (change if it collides)
@@ -76,7 +77,8 @@ per-node switches (live — applied to the running container, no recreate)
   hive <node> net on|off|status        full internet on/off for one node
   hive <node> github on|off|status     give/remove your github token for one node
   hive <node> host on|off|status       let this node run commands on your Mac
-  hive <node> status                   show net + github + host state
+  hive <node> dind on|off|status       nested docker engine (recreates the node)
+  hive <node> status                   show net + github + host + dind state
   hive <node> sh|claude [...]          same as 'hive sh <node>' / 'hive claude <node>'
 
 run commands on the Mac from a node (deliberate, opt-in hole)
@@ -110,6 +112,10 @@ EOF
 
 cmd_build() {
   docker build -f "$HIVE_HOME/images/node/Dockerfile" -t hive/node "$HIVE_HOME"
+  # refresh the dind dev image only if it's already been built
+  if docker image inspect "$DEV_IMAGE" >/dev/null 2>&1; then
+    docker build -f "$HIVE_HOME/images/dev/Dockerfile" -t "$DEV_IMAGE" "$HIVE_HOME"
+  fi
   compose build
 }
 
@@ -158,19 +164,27 @@ cmd_new() {
     die "name must be lowercase alphanumeric plus '-' or '_'"
   fi
 
-  local parent=root bind="" image=$NODE_IMAGE uplink=0 host=0
+  local parent=root bind="" image=$NODE_IMAGE uplink=0 host=0 dind=0 image_set=0
   local extra=()
   while [ $# -gt 0 ]; do
     case $1 in
       --parent) parent=$2; shift 2 ;;
       --bind)   bind=$2;   shift 2 ;;
-      --image)  image=$2;  shift 2 ;;
+      --image)  image=$2; image_set=1; shift 2 ;;
       --uplink) uplink=1;  shift ;;
       --host)   host=1;    shift ;;
+      --dind)   dind=1;    shift ;;
       --) shift; extra=("$@"); break ;;
       *) die "unknown option '$1' (use -- to pass raw docker run args)" ;;
     esac
   done
+  if [ "$dind" = 1 ]; then
+    [ "$image_set" = 0 ] && image=$DEV_IMAGE
+    if ! docker image inspect "$image" >/dev/null 2>&1; then
+      note "building $image (first --dind use; installs a docker engine)…"
+      docker build -f "$HIVE_HOME/images/dev/Dockerfile" -t "$DEV_IMAGE" "$HIVE_HOME" >/dev/null
+    fi
+  fi
 
   if docker container inspect "$PREFIX$name" >/dev/null 2>&1; then
     die "node '$name' already exists"
@@ -190,6 +204,12 @@ cmd_new() {
     --label hive.role=node --label "hive.name=$name" --label "hive.parent=$parent"
     -e "HIVE_NAME=$name" -e "HIVE_PARENT=$parent"
     -v hive-shared:/shared -v hive-claude:/home/dev/.claude)
+
+  # --dind: --privileged is creation-time; a dedicated volume for /var/lib/docker
+  # gives the nested engine a real (ext4) fs so overlay2 works (no overlay-on-overlay)
+  if [ "$dind" = 1 ]; then
+    args+=(--privileged -e HIVE_DIND=1 -v "hive-dind-$name:/var/lib/docker")
+  fi
 
   if [ -n "$bind" ]; then
     case $bind in
@@ -218,6 +238,7 @@ cmd_new() {
   # --host is sugar: create, then turn the live host switch on
   if [ "$host" = 1 ]; then cmd_node_host "$name" on; fi
   echo "node '$name' up (parent: $parent)."
+  if [ "$dind" = 1 ]; then echo "  (nested dockerd starting — 'docker ps' inside works in a few seconds)"; fi
   echo "  hive sh $name            # shell"
   echo "  hive claude $name        # claude"
   echo "  hive $name net on        # give it full internet"
@@ -394,6 +415,38 @@ cmd_node_host() {
   esac
 }
 
+# dind needs --privileged, a creation-time capability — so toggling it on a
+# running node transparently recreates it, preserving the workspace and the
+# net/github/host state (the container fs is rebuilt from the image).
+cmd_node_dind() {
+  local node=$1 action=${2:-status} c="$PREFIX$1"
+  docker container inspect "$c" >/dev/null 2>&1 || die "no such node: $node"
+  case $action in
+    status)
+      if docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$c" | grep -qx 'HIVE_DIND=1'; then
+        echo "dind:   ON  ($node has a nested docker engine)"
+      else echo "dind:   OFF ($node)"; fi ;;
+    on|off)
+      local parent bind neton=0 githubon=0 hoston=0
+      parent=$(docker inspect -f '{{index .Config.Labels "hive.parent"}}' "$c")
+      bind=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/workspace"}}{{if eq .Type "bind"}}{{.Source}}{{end}}{{end}}{{end}}' "$c")
+      if node_is_open "$c"; then neton=1; fi
+      if docker exec -u dev "$c" test -f /home/dev/.git-credentials 2>/dev/null; then githubon=1; fi
+      if docker exec -u dev "$c" test -f /home/dev/.config/hive/hostd-token 2>/dev/null; then hoston=1; fi
+      note "recreating $node to turn dind $action (workspace + state preserved)…"
+      docker rm -f "$c" >/dev/null
+      local nargs=(--parent "$parent")
+      if [ -n "$bind" ]; then nargs+=(--bind "$bind"); fi
+      if [ "$action" = on ]; then nargs+=(--dind); fi
+      cmd_new "$node" "${nargs[@]}" >/dev/null
+      if [ "$neton" = 1 ]; then cmd_node_net "$node" on >/dev/null; fi
+      if [ "$githubon" = 1 ]; then cmd_node_github "$node" on >/dev/null; fi
+      if [ "$hoston" = 1 ]; then cmd_node_host "$node" on >/dev/null; fi
+      echo "dind: $action for $node (recreated; workspace, net, github, host preserved)" ;;
+    *) die "usage: hive $node dind on|off|status" ;;
+  esac
+}
+
 cmd_node_status() {
   local node=$1 c="$PREFIX$1"
   docker container inspect "$c" >/dev/null 2>&1 || die "no such node: $node"
@@ -401,6 +454,7 @@ cmd_node_status() {
   cmd_node_net "$node" status
   cmd_node_github "$node" status
   cmd_node_host "$node" status
+  cmd_node_dind "$node" status
 }
 
 # ---------------- host daemon (Mac side) ----------------
@@ -469,6 +523,9 @@ cmd_rm() {
     if [ "$purge" = 1 ]; then
       if docker volume rm "hive-ws-$n" >/dev/null 2>&1; then
         echo "purged volume hive-ws-$n"
+      fi
+      if docker volume rm "hive-dind-$n" >/dev/null 2>&1; then
+        echo "purged volume hive-dind-$n"
       fi
     fi
   done
@@ -754,10 +811,11 @@ case $cmd in
         net)        cmd_node_net    "$cmd" "$@" ;;
         github)     cmd_node_github "$cmd" "$@" ;;
         host)       cmd_node_host   "$cmd" "$@" ;;
+        dind)       cmd_node_dind   "$cmd" "$@" ;;
         sh)         cmd_sh          "$cmd" "$@" ;;
         claude)     cmd_claude      "$cmd" "$@" ;;
         status)     cmd_node_status "$cmd" ;;
-        *) die "unknown verb '$verb' for node '$cmd' (net|github|host|sh|claude|status)" ;;
+        *) die "unknown verb '$verb' for node '$cmd' (net|github|host|dind|sh|claude|status)" ;;
       esac
     else
       echo "hive: unknown command or node: $cmd" >&2
