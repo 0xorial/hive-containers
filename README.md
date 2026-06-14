@@ -156,6 +156,36 @@ use remotes like `ssh://git@ssh.github.com:443/owner/repo.git`.
 
 > Full internet + published ports from creation: `hive new web --uplink -- -p 3000:3000`.
 
+## Running commands on the Mac from a node (opt-in, live)
+
+For workflows where a node should drive your Mac — e.g. a node that develops
+hive itself, then asks the Mac to redeploy the running hive — there's a
+deliberate, opt-in channel:
+
+```sh
+hive hostd start            # Mac: start the daemon + a bridge forward
+hive <node> host on         # bless a node (live — injects a secret token)
+# then, inside that node:
+host "cd ~/hive-containers && git pull && hive build && hive up"
+```
+
+It's a **live, per-node switch** like `net`/`github` — `host on`/`off` inject or
+remove the token in the running container, no recreate. `hive new x --host` is
+just sugar for new + host on.
+
+How it works: `host <cmd>` POSTs the command (with the node's private token) to
+the Mac daemon via `bridge:8765`; the daemon runs it **as you** and returns the
+output. The daemon binds **loopback only** (`127.0.0.1`) — Colima's host gateway
+forwards arrive there — so the command port is never exposed on your LAN, only
+through the bridge. Every command is logged (`hive hostd logs`). Default working
+directory is your hive checkout, so deploy one-liners are short.
+
+> ⚠️ **This is real remote code execution on your Mac.** A `host on` node can run
+> *anything* as your user — combined with `github on`, a compromised node could
+> push code and have your Mac run it. It is **off by default**, gated by a secret
+> token that lives only inside blessed nodes, and bound to loopback — but treat
+> any `host on` node as fully trusted, and `host off` it when you're done.
+
 ## Claude desktop app
 
 The desktop app's SSH sessions run entirely inside a node while the app is

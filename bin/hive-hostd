@@ -1,0 +1,98 @@
+#!/usr/bin/env python3
+"""hive-hostd — runs commands that blessed hive nodes request, on this Mac.
+
+This is a deliberate hole in hive's isolation. A node turned on with
+`hive <node> host on` is handed a secret token (privately, into that node only)
+and can POST a command here; this daemon runs it *as you* and returns the
+output. Every command is logged. Treat any host-enabled node as fully trusted:
+it can run anything on your Mac.
+
+No token in the request = refused. The token gates everything, so keep it
+secret and only `host on` the nodes you trust. Bind address is configurable
+(HIVE_HOSTD_BIND); it must be reachable from the bridge, so it can't be
+loopback — keep your macOS firewall on.
+"""
+import hmac, json, os, pathlib, subprocess, sys, time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+HOME = pathlib.Path.home()
+CFG = HOME / ".config" / "hive"
+TOKEN_FILE = CFG / "hostd-token"
+LOG = CFG / "hostd.log"
+# The bridge's socat forward reaches us over Colima's host gateway, which lands
+# on loopback — so bind 127.0.0.1 and the RCE port is never exposed on the LAN.
+BIND = os.environ.get("HIVE_HOSTD_BIND", "127.0.0.1")
+PORT = int(os.environ.get("HIVE_HOSTD_PORT", "8765"))
+# commands run here by default (the Mac's hive checkout), so `git pull && hive up` just works
+WORKDIR = os.environ.get("HIVE_HOSTD_CWD") or str(pathlib.Path(__file__).resolve().parent.parent)
+MAX_SECONDS = int(os.environ.get("HIVE_HOSTD_TIMEOUT", "1800"))
+
+TOKEN = TOKEN_FILE.read_text().strip()
+
+
+def log(msg):
+    line = f"{time.strftime('%Y-%m-%dT%H:%M:%S')} {msg}"
+    try:
+        with open(LOG, "a") as f:
+            f.write(line + "\n")
+    except OSError:
+        pass
+    print("hostd: " + msg, file=sys.stderr, flush=True)
+
+
+class Handler(BaseHTTPRequestHandler):
+    def _send(self, code, obj):
+        body = json.dumps(obj).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        if self.path == "/health":
+            return self._send(200, {"ok": True})
+        self._send(404, {"error": "not found"})
+
+    def do_POST(self):
+        if self.path != "/run":
+            return self._send(404, {"error": "not found"})
+        src = self.client_address[0]
+        try:
+            n = int(self.headers.get("Content-Length", "0"))
+            req = json.loads(self.rfile.read(n) or b"{}")
+        except Exception:
+            return self._send(400, {"error": "bad request"})
+        if not hmac.compare_digest(str(req.get("token", "")), TOKEN):
+            log(f"DENIED {src} (bad/no token)")
+            return self._send(403, {"error": "bad token"})
+        cmd = req.get("cmd", "")
+        if not cmd:
+            return self._send(400, {"error": "empty command"})
+        cwd = req.get("cwd") or WORKDIR
+        log(f"RUN {src} (cwd={cwd}): {cmd}")
+        try:
+            p = subprocess.run(["bash", "-lc", cmd], cwd=cwd,
+                               capture_output=True, text=True, timeout=MAX_SECONDS)
+            log(f"DONE {src} exit={p.returncode}")
+            self._send(200, {"exit": p.returncode, "stdout": p.stdout, "stderr": p.stderr})
+        except subprocess.TimeoutExpired:
+            log(f"TIMEOUT {src}")
+            self._send(200, {"exit": 124, "stdout": "", "stderr": f"timed out after {MAX_SECONDS}s"})
+
+    def log_message(self, *a):
+        pass
+
+
+def main():
+    CFG.mkdir(parents=True, exist_ok=True)
+    srv = ThreadingHTTPServer((BIND, PORT), Handler)
+    log(f"listening on {BIND}:{PORT} (cwd={WORKDIR}, timeout={MAX_SECONDS}s)")
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == "__main__":
+    main()

@@ -76,7 +76,8 @@ RUN mkdir -p /workspace /shared /home/dev/.claude \
  && chown dev:dev /home/dev/.zshrc
 
 COPY images/node/entrypoint.sh /usr/local/bin/hive-entrypoint
-RUN chmod +x /usr/local/bin/hive-entrypoint
+COPY templates/host-client.py /usr/local/bin/host
+RUN chmod +x /usr/local/bin/hive-entrypoint /usr/local/bin/host
 
 WORKDIR /workspace
 USER root

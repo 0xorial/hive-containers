@@ -8,6 +8,9 @@ UPLINK=hive-uplink
 PROXY=http://bridge:3128
 NO_PROXY_LIST=localhost,127.0.0.1,bridge
 NODE_IMAGE=${HIVE_NODE_IMAGE:-hive/node}
+HOSTD_TOKEN_FILE="$HOME/.config/hive/hostd-token"
+HOSTD_PORT=8765                                   # node-facing port on the bridge (inside hive-net)
+HOSTD_MAC_PORT=${HIVE_HOSTD_MAC_PORT:-8799}       # the Mac daemon's port (change if it collides)
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HIVE_HOME="${HIVE_HOME:-$(dirname "$script_dir")}"
@@ -69,11 +72,17 @@ nodes
   hive rm <name>... [--purge]      remove node(s); --purge also deletes workspace volume
   hive join <container> [--uplink] attach an existing container to the hive network
 
-per-node switches (live, instant — applied at the bridge, not in the node)
+per-node switches (live — applied to the running container, no recreate)
   hive <node> net on|off|status        full internet on/off for one node
   hive <node> github on|off|status     give/remove your github token for one node
-  hive <node> status                   show net + github state
+  hive <node> host on|off|status       let this node run commands on your Mac
+  hive <node> status                   show net + github + host state
   hive <node> sh|claude [...]          same as 'hive sh <node>' / 'hive claude <node>'
+
+run commands on the Mac from a node (deliberate, opt-in hole)
+  hive hostd start|stop|status|logs    the Mac-side daemon + bridge forward
+  hive <node> host on                  then, inside the node:  host <command>
+  hive new <name> --host               sugar for: new + host on
 
 desktop app / direct ssh
   hive ssh setup                   one-time: key + ~/.ssh/config + install into nodes
@@ -149,7 +158,7 @@ cmd_new() {
     die "name must be lowercase alphanumeric plus '-' or '_'"
   fi
 
-  local parent=root bind="" image=$NODE_IMAGE uplink=0
+  local parent=root bind="" image=$NODE_IMAGE uplink=0 host=0
   local extra=()
   while [ $# -gt 0 ]; do
     case $1 in
@@ -157,6 +166,7 @@ cmd_new() {
       --bind)   bind=$2;   shift 2 ;;
       --image)  image=$2;  shift 2 ;;
       --uplink) uplink=1;  shift ;;
+      --host)   host=1;    shift ;;
       --) shift; extra=("$@"); break ;;
       *) die "unknown option '$1' (use -- to pass raw docker run args)" ;;
     esac
@@ -205,6 +215,8 @@ cmd_new() {
   if [ -f "$HOME/.ssh/hive_ed25519.pub" ]; then
     inject_ssh_key "$PREFIX$name" || note "warning: could not install ssh key in $name"
   fi
+  # --host is sugar: create, then turn the live host switch on
+  if [ "$host" = 1 ]; then cmd_node_host "$name" on; fi
   echo "node '$name' up (parent: $parent)."
   echo "  hive sh $name            # shell"
   echo "  hive claude $name        # claude"
@@ -358,12 +370,86 @@ cmd_node_github() {
   esac
 }
 
+# host on/off is a LIVE toggle: the capability is a secret token injected into
+# (or removed from) the running node via docker exec — no recreate, like net
+# and github. `hive new --host` is just sugar for this.
+cmd_node_host() {
+  local node=$1 action=${2:-status} c="$PREFIX$1"
+  docker container inspect "$c" >/dev/null 2>&1 || die "no such node: $node"
+  case $action in
+    on)
+      [ -f "$HOSTD_TOKEN_FILE" ] || die "no host daemon yet — run: hive hostd start"
+      docker exec -i -u dev "$c" sh -c 'mkdir -p ~/.config/hive && umask 077 && cat > ~/.config/hive/hostd-token' < "$HOSTD_TOKEN_FILE"
+      echo "host: ON for $node — it can now run Mac commands with: host <cmd>"
+      docker exec "${PREFIX}bridge" pgrep -f "TCP-LISTEN:$HOSTD_PORT" >/dev/null 2>&1 \
+        || note "the daemon/forward isn't up yet — run: hive hostd start" ;;
+    off)
+      docker exec -u dev "$c" rm -f /home/dev/.config/hive/hostd-token 2>/dev/null || true
+      echo "host: OFF for $node (token removed)" ;;
+    status)
+      if docker exec -u dev "$c" test -f /home/dev/.config/hive/hostd-token 2>/dev/null; then
+        echo "host:   ON  ($node can run commands on the Mac)"
+      else echo "host:   OFF ($node)"; fi ;;
+    *) die "usage: hive $node host on|off|status" ;;
+  esac
+}
+
 cmd_node_status() {
   local node=$1 c="$PREFIX$1"
   docker container inspect "$c" >/dev/null 2>&1 || die "no such node: $node"
   echo "$node:"
   cmd_node_net "$node" status
   cmd_node_github "$node" status
+  cmd_node_host "$node" status
+}
+
+# ---------------- host daemon (Mac side) ----------------
+
+cmd_hostd() {
+  local sub=${1:-status}
+  local pidf="$HOME/.config/hive/hostd.pid" logf="$HOME/.config/hive/hostd.log"
+  local daemon="$HIVE_HOME/bin/hive-hostd"
+  case $sub in
+    start)
+      mkdir -p "$HOME/.config/hive" && chmod 700 "$HOME/.config/hive"
+      if [ ! -f "$HOSTD_TOKEN_FILE" ]; then
+        ( umask 077; openssl rand -hex 32 > "$HOSTD_TOKEN_FILE" ); echo "generated host token ($HOSTD_TOKEN_FILE)"
+      fi
+      if curl -fsS -m 3 "http://127.0.0.1:$HOSTD_MAC_PORT/health" >/dev/null 2>&1; then
+        echo "hostd already running on Mac:$HOSTD_MAC_PORT"
+      else
+        HIVE_HOSTD_PORT=$HOSTD_MAC_PORT nohup python3 "$daemon" >>"$logf" 2>&1 &
+        echo $! > "$pidf"; sleep 1
+        if ! curl -fsS -m 3 "http://127.0.0.1:$HOSTD_MAC_PORT/health" >/dev/null 2>&1; then
+          note "hostd failed to bind Mac:$HOSTD_MAC_PORT (in use?). Set a free port: HIVE_HOSTD_MAC_PORT=NNNN hive hostd start"
+          tail -n 3 "$logf" 2>/dev/null | sed 's/^/  /'
+          return 1
+        fi
+        echo "hostd running on Mac:$HOSTD_MAC_PORT (pid $(cat "$pidf")) — logs: hive hostd logs"
+      fi
+      # bridge forwards its fixed node-facing port to the Mac daemon's port
+      docker exec "${PREFIX}bridge" pkill -f "TCP-LISTEN:$HOSTD_PORT" 2>/dev/null || true
+      docker exec -d "${PREFIX}bridge" socat "TCP-LISTEN:$HOSTD_PORT,fork,reuseaddr" "TCP:host.docker.internal:$HOSTD_MAC_PORT"
+      echo "bridge forward bridge:$HOSTD_PORT -> Mac:$HOSTD_MAC_PORT"
+      echo "now bless nodes:  hive <node> host on"
+      ;;
+    stop)
+      if [ -f "$pidf" ]; then kill "$(cat "$pidf")" 2>/dev/null || true; rm -f "$pidf"; fi
+      pkill -f "$daemon" 2>/dev/null || true
+      docker exec "${PREFIX}bridge" pkill -f "TCP-LISTEN:$HOSTD_PORT" 2>/dev/null || true
+      echo "hostd stopped"
+      ;;
+    status)
+      if curl -fsS -m 3 "http://127.0.0.1:$HOSTD_MAC_PORT/health" >/dev/null 2>&1; then
+        echo "hostd: running (Mac:$HOSTD_MAC_PORT)"
+      else echo "hostd: stopped"; fi
+      docker exec "${PREFIX}bridge" pgrep -f "TCP-LISTEN:$HOSTD_PORT" >/dev/null 2>&1 \
+        && echo "bridge forward: up (bridge:$HOSTD_PORT -> Mac:$HOSTD_MAC_PORT)" || echo "bridge forward: down"
+      ;;
+    logs)
+      tail -n "${2:-40}" "$logf" 2>/dev/null || echo "(no log yet)" ;;
+    *) die "usage: hive hostd start|stop|status|logs" ;;
+  esac
 }
 
 cmd_rm() {
@@ -656,6 +742,7 @@ case $cmd in
   join)          cmd_join "$@" ;;
   ssh)           cmd_ssh "$@" ;;
   github)        cmd_github "$@" ;;
+  hostd)         cmd_hostd "$@" ;;
   bridge)        cmd_bridge "$@" ;;
   devcontainer)  cmd_devcontainer "$@" ;;
   help|-h|--help) usage ;;
@@ -666,10 +753,11 @@ case $cmd in
       case $verb in
         net)        cmd_node_net    "$cmd" "$@" ;;
         github)     cmd_node_github "$cmd" "$@" ;;
+        host)       cmd_node_host   "$cmd" "$@" ;;
         sh)         cmd_sh          "$cmd" "$@" ;;
         claude)     cmd_claude      "$cmd" "$@" ;;
         status)     cmd_node_status "$cmd" ;;
-        *) die "unknown verb '$verb' for node '$cmd' (net|github|sh|claude|status)" ;;
+        *) die "unknown verb '$verb' for node '$cmd' (net|github|host|sh|claude|status)" ;;
       esac
     else
       echo "hive: unknown command or node: $cmd" >&2
