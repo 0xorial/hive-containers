@@ -34,6 +34,13 @@ elif [ -f "$HIVE_HOME/config/docker-context" ]; then
   fi
 fi
 
+# OCI runtime for nodes. Empty = the engine default (runc). Set to e.g. "kata"
+# (once registered in the engine) for VM-isolated nodes. config/runtime or env.
+NODE_RUNTIME="${HIVE_RUNTIME:-}"
+if [ -z "$NODE_RUNTIME" ] && [ -f "$HIVE_HOME/config/runtime" ]; then
+  NODE_RUNTIME="$(head -1 "$HIVE_HOME/config/runtime" | tr -d '[:space:]')"
+fi
+
 die()  { echo "hive: $*" >&2; exit 1; }
 note() { echo "hive: $*" >&2; }
 
@@ -210,6 +217,8 @@ cmd_new() {
   if [ "$dind" = 1 ]; then
     args+=(--privileged -e HIVE_DIND=1 -v "hive-dind-$name:/var/lib/docker")
   fi
+  # VM-isolated runtime (e.g. kata) when configured and registered in the engine
+  if [ -n "$NODE_RUNTIME" ]; then args+=(--runtime "$NODE_RUNTIME"); fi
 
   if [ -n "$bind" ]; then
     case $bind in
@@ -736,6 +745,7 @@ check() {
 cmd_doctor() {
   DOCTOR_FAIL=0
   echo "  engine: ${DOCKER_CONTEXT:-$(docker context show 2>/dev/null || echo default)}"
+  echo "  node runtime: ${NODE_RUNTIME:-engine default (runc)}  |  available: $(docker info --format '{{range $k,$v := .Runtimes}}{{$k}} {{end}}' 2>/dev/null)"
   check "docker daemon reachable"            docker info
   check "bridge container running"           docker exec "${PREFIX}bridge" true
   check "root container running"             docker exec "${PREFIX}root" true
