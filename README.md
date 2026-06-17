@@ -213,6 +213,29 @@ The intended loop: develop hive in the node → `git push` → `host "cd
 ~/hive-containers && git pull && hive build && hive up"` to redeploy the hive
 running on your Mac.
 
+## Remote Control — steer node sessions from your phone
+
+To monitor or steer a node's interactive Claude session from claude.ai or the
+Claude mobile app, turn on Remote Control — fleet-wide or per node:
+
+```sh
+hive remote on              # all nodes
+hive nrg remote on          # ...or just one
+hive claude nrg             # this interactive session now appears at claude.ai/code
+```
+
+It's a launch-flag toggle: when a node is remote-enabled, `hive claude <node>`
+adds `--rc`, so that session registers for Remote Control (headless `-p` runs
+are left alone). State lives in `config/remote-nodes` (`*` = all). The root
+manager can flip it across the fleet. It fits the seal cleanly — Remote Control
+is **outbound HTTPS only, no inbound ports**, and `api.anthropic.com` is already
+allowlisted, so a sealed node works with no new hole.
+
+Prerequisite: a **claude.ai login** (`hive claude root` → `/login`); it's shared
+across all nodes via the `hive-claude` volume. Remote Control rejects API-key /
+`setup-token` auth. (Note: there's no persistent claude config key for this —
+`--rc` at launch is the only documented mechanism, which is why hive drives it.)
+
 ## Claude desktop app
 
 The desktop app's SSH sessions run entirely inside a node while the app is

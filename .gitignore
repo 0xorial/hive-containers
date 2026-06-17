@@ -1,2 +1,3 @@
 # runtime state, not configuration
 config/open-nodes
+config/remote-nodes

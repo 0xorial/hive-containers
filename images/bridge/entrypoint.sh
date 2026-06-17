@@ -15,6 +15,9 @@ ALLOWED_RE="$RUN/allowed_regex"
 OPEN="$RUN/open"
 
 mkdir -p "$RUN"
+# squid runs as PID 1 here; a stale pidfile (PID 1) survives a restart and makes
+# squid abort with "already running". Clear it so restarts recover cleanly.
+rm -f "$RUN/squid.pid"
 : > "$ALLOWED"
 : > "$ALLOWED_RE"
 
