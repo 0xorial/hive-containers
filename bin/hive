@@ -41,10 +41,6 @@ if [ -z "$NODE_RUNTIME" ] && [ -f "$HIVE_HOME/config/runtime" ]; then
   NODE_RUNTIME="$(head -1 "$HIVE_HOME/config/runtime" | tr -d '[:space:]')"
 fi
 
-# Nodes whose interactive `hive claude` sessions auto-register for Remote Control
-# (claude.ai/phone steering). Holds node names, or "*" for all. Runtime state.
-REMOTE_NODES_FILE="$HIVE_HOME/config/remote-nodes"
-
 die()  { echo "hive: $*" >&2; exit 1; }
 note() { echo "hive: $*" >&2; }
 
@@ -89,13 +85,8 @@ per-node switches (live — applied to the running container, no recreate)
   hive <node> github on|off|status     give/remove your github token for one node
   hive <node> host on|off|status       let this node run commands on your Mac
   hive <node> dind on|off|status       nested docker engine (recreates the node)
-  hive <node> remote on|off|status     interactive 'hive claude' sessions steerable from phone/web
-  hive <node> status                   show net + github + host + dind + remote state
+  hive <node> status                   show net + github + host + dind state
   hive <node> sh|claude [...]          same as 'hive sh <node>' / 'hive claude <node>'
-
-remote control (steer node sessions from claude.ai / phone; needs 'hive claude root' login)
-  hive remote on|off|status            enable/disable Remote Control across ALL nodes
-  hive <node> remote on|off            ...or just one node
 
 run commands on the Mac from a node (deliberate, opt-in hole)
   hive hostd start|stop|status|logs    the Mac-side daemon + bridge forward
@@ -325,26 +316,7 @@ cmd_sh() {
 cmd_claude() {
   if [ $# -lt 1 ]; then die "usage: hive claude <node> [claude args...]"; fi
   local name=$1; shift
-  # If remote is enabled for this node and this is an interactive session
-  # (not -p/--print, not already --rc), register it for Remote Control.
-  if node_remote_enabled "$name" && ! printf '%s\n' "$@" | grep -qxE -- '-p|--print|--rc|--remote-control'; then
-    docker exec "$(tty_flags)" -u dev -w /workspace "$PREFIX$name" claude --rc "$@"
-  else
-    docker exec "$(tty_flags)" -u dev -w /workspace "$PREFIX$name" claude "$@"
-  fi
-}
-
-# remote = which nodes' interactive claude sessions auto-enable Remote Control
-node_remote_enabled() {
-  [ -f "$REMOTE_NODES_FILE" ] || return 1
-  grep -qxF '*' "$REMOTE_NODES_FILE" 2>/dev/null && return 0
-  grep -qxF "$1" "$REMOTE_NODES_FILE" 2>/dev/null
-}
-claude_logged_in() {
-  docker exec -u dev "${PREFIX}root" test -f /home/dev/.claude/.credentials.json 2>/dev/null
-}
-remote_login_note() {
-  claude_logged_in || note "Claude is NOT logged in hive-wide — Remote Control needs a claude.ai login: run 'hive claude root' then /login"
+  docker exec "$(tty_flags)" -u dev -w /workspace "$PREFIX$name" claude "$@"
 }
 
 # ---------------- per-node switches ----------------
@@ -484,48 +456,6 @@ cmd_node_dind() {
   esac
 }
 
-# Remote Control: a launch-flag toggle (no recreate, no claude config key — the
-# only documented mechanism is the --rc flag). Fleet-wide ("*") or per-node;
-# hive adds --rc when launching an interactive `hive claude <node>`.
-cmd_node_remote() {
-  local node=$1 action=${2:-status} c="$PREFIX$1"
-  docker container inspect "$c" >/dev/null 2>&1 || die "no such node: $node"
-  mkdir -p "$(dirname "$REMOTE_NODES_FILE")"; touch "$REMOTE_NODES_FILE"
-  case $action in
-    on)
-      grep -qxF "$node" "$REMOTE_NODES_FILE" 2>/dev/null || printf '%s\n' "$node" >> "$REMOTE_NODES_FILE"
-      echo "remote: ON for $node — 'hive claude $node' (interactive) registers for Remote Control"
-      remote_login_note ;;
-    off)
-      grep -vxF "$node" "$REMOTE_NODES_FILE" > "$REMOTE_NODES_FILE.tmp" 2>/dev/null || true
-      mv "$REMOTE_NODES_FILE.tmp" "$REMOTE_NODES_FILE"
-      echo "remote: OFF for $node" ;;
-    status)
-      if node_remote_enabled "$node"; then echo "remote: ON  ($node)"; else echo "remote: OFF ($node)"; fi ;;
-    *) die "usage: hive $node remote on|off|status" ;;
-  esac
-}
-
-# Fleet-wide remote toggle (manager-friendly): all nodes at once.
-cmd_remote() {
-  local sub=${1:-status}
-  mkdir -p "$(dirname "$REMOTE_NODES_FILE")"
-  case $sub in
-    on)  echo '*' > "$REMOTE_NODES_FILE"
-         echo "remote: ON for ALL nodes — interactive 'hive claude <node>' sessions register for Remote Control"
-         remote_login_note ;;
-    off) : > "$REMOTE_NODES_FILE"; echo "remote: OFF for all nodes" ;;
-    status)
-      if [ -f "$REMOTE_NODES_FILE" ] && grep -qxF '*' "$REMOTE_NODES_FILE" 2>/dev/null; then
-        echo "remote: ON (all nodes)"
-      elif [ -s "$REMOTE_NODES_FILE" ]; then
-        echo "remote: ON for: $(tr '\n' ' ' < "$REMOTE_NODES_FILE")"
-      else echo "remote: OFF"; fi
-      claude_logged_in && echo "  claude login: present" || echo "  claude login: MISSING (hive claude root → /login)" ;;
-    *) die "usage: hive remote on|off|status" ;;
-  esac
-}
-
 cmd_node_status() {
   local node=$1 c="$PREFIX$1"
   docker container inspect "$c" >/dev/null 2>&1 || die "no such node: $node"
@@ -534,7 +464,6 @@ cmd_node_status() {
   cmd_node_github "$node" status
   cmd_node_host "$node" status
   cmd_node_dind "$node" status
-  cmd_node_remote "$node" status
 }
 
 # ---------------- host daemon (Mac side) ----------------
@@ -881,7 +810,6 @@ case $cmd in
   ssh)           cmd_ssh "$@" ;;
   github)        cmd_github "$@" ;;
   hostd)         cmd_hostd "$@" ;;
-  remote)        cmd_remote "$@" ;;
   bridge)        cmd_bridge "$@" ;;
   devcontainer)  cmd_devcontainer "$@" ;;
   help|-h|--help) usage ;;
@@ -894,11 +822,10 @@ case $cmd in
         github)     cmd_node_github "$cmd" "$@" ;;
         host)       cmd_node_host   "$cmd" "$@" ;;
         dind)       cmd_node_dind   "$cmd" "$@" ;;
-        remote)     cmd_node_remote "$cmd" "$@" ;;
         sh)         cmd_sh          "$cmd" "$@" ;;
         claude)     cmd_claude      "$cmd" "$@" ;;
         status)     cmd_node_status "$cmd" ;;
-        *) die "unknown verb '$verb' for node '$cmd' (net|github|host|dind|remote|sh|claude|status)" ;;
+        *) die "unknown verb '$verb' for node '$cmd' (net|github|host|dind|sh|claude|status)" ;;
       esac
     else
       echo "hive: unknown command or node: $cmd" >&2
