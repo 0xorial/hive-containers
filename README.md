@@ -40,7 +40,7 @@ Three guarantees, all enforced by Docker networking rather than convention:
 alias hive="$PWD/bin/hive"     # or add bin/ to PATH
 
 hive up                        # build + start root and bridge
-hive claude root               # log in once; credentials are shared hive-wide
+hive claude root               # log in (per-node: each container has its own credentials)
 hive ssh setup                 # once: lets the Claude desktop app open sessions in nodes
 hive doctor                    # verify the isolation actually holds
 
@@ -86,8 +86,9 @@ inside `root`** — `root` holds the Docker socket and has `hive` on its PATH
 can `hive new`, `hive <node> net on`, `hive tree`, and `hive claude <node> -p
 "..."` its children, then collect results through the `/shared` volume. The
 one split: lifecycle commands (`build` / `up` / `down`) stay on the Mac,
-because they manage the container set that includes `root` itself. Every
-container also shares the `hive-claude` volume, so you authenticate once.
+because they manage the container set that includes `root` itself. Each
+container has its own `hive-claude-<name>` volume, so credentials and history
+are isolated per node — you authenticate each container separately.
 
 ## The bridge — your curation surface
 
@@ -332,8 +333,10 @@ a Qubes-style network VM."
 - `root` + the Docker socket = control of the Docker VM and every container.
   Treat `root` as trusted infrastructure: it's your orchestrator, not a
   sandbox for untrusted work — untrusted work belongs in nodes.
-- Claude credentials are shared via the `hive-claude` volume: log in once,
-  every node is authenticated. Delete the volume to revoke.
+- Claude credentials are **per-node**: each container has its own
+  `hive-claude-<name>` volume (root's is `hive-claude-root`), so a login in one
+  node is not visible to any other. Authenticate each node separately; delete
+  its volume to revoke just that node (`hive rm <node> --purge` does this).
 
 ## Layout
 

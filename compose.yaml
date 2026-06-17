@@ -13,7 +13,10 @@ volumes:
   shared:
     name: hive-shared
   claude:
-    name: hive-claude
+    # Per-node Claude state: root gets its own volume, just like every `hive new`
+    # node gets hive-claude-<name>. Credentials/history are NOT shared across the
+    # hive — each container logs in on its own.
+    name: hive-claude-root
 
 x-proxy-env: &proxy-env
   HIVE_PROXY: http://bridge:3128

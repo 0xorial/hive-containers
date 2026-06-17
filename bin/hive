@@ -139,7 +139,7 @@ cmd_up() {
   echo
   echo "hive is up.  next steps:"
   echo "  hive sh root          # shell in the control plane"
-  echo "  hive claude root      # claude in the control plane (login once, shared by all nodes)"
+  echo "  hive claude root      # claude in the control plane (own login; creds are per-node)"
   echo "  hive new <name>       # spawn a node"
   echo "  hive doctor           # verify isolation + bridge"
 }
@@ -210,7 +210,7 @@ cmd_new() {
     --restart unless-stopped
     --label hive.role=node --label "hive.name=$name" --label "hive.parent=$parent"
     -e "HIVE_NAME=$name" -e "HIVE_PARENT=$parent"
-    -v hive-shared:/shared -v hive-claude:/home/dev/.claude)
+    -v hive-shared:/shared -v "hive-claude-$name:/home/dev/.claude")
 
   # --dind: --privileged is creation-time; a dedicated volume for /var/lib/docker
   # gives the nested engine a real (ext4) fs so overlay2 works (no overlay-on-overlay)
@@ -536,6 +536,9 @@ cmd_rm() {
       if docker volume rm "hive-dind-$n" >/dev/null 2>&1; then
         echo "purged volume hive-dind-$n"
       fi
+      if docker volume rm "hive-claude-$n" >/dev/null 2>&1; then
+        echo "purged volume hive-claude-$n"
+      fi
     fi
   done
 }
@@ -595,6 +598,9 @@ Host ${PREFIX}*
   StrictHostKeyChecking no
   UserKnownHostsFile /dev/null
   LogLevel ERROR
+  ServerAliveInterval 20
+  ServerAliveCountMax 6
+  TCPKeepAlive yes
 # <<< hive managed <<<
 EOF
   mv "$cfg.tmp" "$cfg" && chmod 600 "$cfg"
