@@ -219,6 +219,7 @@ git add -A
 git diff --cached --quiet || git commit -q -m "hive: initial project scaffold"
 EOSH
   setup_project_github "$name" "$c"
+  inject_read_token "$c"
 }
 
 # Best-effort: private GitHub repo (matching name) + write deploy key generated
@@ -735,6 +736,49 @@ EOF
 # ---------------- private github ----------------
 
 GH_TOKEN_FILE="$HOME/.config/hive/github-token"
+GH_APP_DIR="$HOME/.config/hive/github-app"
+
+_b64url() { openssl base64 -A | tr '+/' '-_' | tr -d '='; }
+
+# Mint a ~1h GitHub App installation token (read-all). Echoes the token, or
+# nothing if the App isn't configured. Runs on the Mac — the App private key
+# never leaves the Mac; only the short-lived token is handed to a container.
+github_app_token() {
+  local app inst pem now header payload sig jwt
+  app=$(cat "$GH_APP_DIR/app-id" 2>/dev/null)
+  inst=$(cat "$GH_APP_DIR/installation-id" 2>/dev/null)
+  pem="$GH_APP_DIR/app.pem"
+  [ -n "$app" ] && [ -n "$inst" ] && [ -f "$pem" ] || return 1
+  command -v openssl >/dev/null 2>&1 || return 1
+  now=$(date +%s)
+  header=$(printf '{"alg":"RS256","typ":"JWT"}' | _b64url)
+  payload=$(printf '{"iat":%d,"exp":%d,"iss":"%s"}' $((now-60)) $((now+540)) "$app" | _b64url)
+  sig=$(printf '%s.%s' "$header" "$payload" | openssl dgst -sha256 -sign "$pem" -binary | _b64url)
+  jwt="$header.$payload.$sig"
+  curl -s -X POST -H "Authorization: Bearer $jwt" -H "Accept: application/vnd.github+json" \
+    "https://api.github.com/app/installations/$inst/access_tokens" \
+    | python3 -c 'import sys,json; print(json.load(sys.stdin).get("token",""))' 2>/dev/null
+}
+
+# Install a fresh read-all token as the HTTPS git credential in a container (for
+# reading ANY of your repos). Origin uses the SSH deploy key, so this doesn't
+# touch the project's own push path. Token is short-lived — re-run to refresh.
+inject_read_token() {
+  local c=$1 tok
+  tok=$(github_app_token) || true
+  if [ -z "$tok" ]; then
+    note "read-all token skipped (GitHub App not configured at $GH_APP_DIR or unreachable)"
+    return 0
+  fi
+  printf '%s' "$tok" | docker exec -i -u dev "$c" bash -c '
+    tok=$(cat); umask 077; f="$HOME/.git-credentials"
+    [ -f "$f" ] && grep -v "x-access-token:.*@github.com" "$f" > "$f.tmp" 2>/dev/null || : > "$f.tmp"
+    printf "https://x-access-token:%s@github.com\n" "$tok" >> "$f.tmp"
+    mv "$f.tmp" "$f"
+    git config --global credential.helper store
+  '
+  echo "  read-all token injected (read-only, ~1h; refresh: hive <node> token)"
+}
 
 # Install a token into one container: git credential helper (HTTPS) + gh CLI.
 # Token arrives on stdin, never via argv/env/image layers.
@@ -934,10 +978,12 @@ case $cmd in
         dind)       cmd_node_dind   "$cmd" "$@" ;;
         repo)       docker container inspect "$PREFIX$cmd" >/dev/null 2>&1 || die "no such node: $cmd"
                     setup_project_github "$cmd" "$PREFIX$cmd" ;;
+        token)      docker container inspect "$PREFIX$cmd" >/dev/null 2>&1 || die "no such node: $cmd"
+                    inject_read_token "$PREFIX$cmd" ;;
         sh)         cmd_sh          "$cmd" "$@" ;;
         claude)     cmd_claude      "$cmd" "$@" ;;
         status)     cmd_node_status "$cmd" ;;
-        *) die "unknown verb '$verb' for node '$cmd' (net|github|host|dind|repo|sh|claude|status)" ;;
+        *) die "unknown verb '$verb' for node '$cmd' (net|github|host|dind|repo|token|sh|claude|status)" ;;
       esac
     else
       echo "hive: unknown command or node: $cmd" >&2
