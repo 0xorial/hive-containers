@@ -1,0 +1,30 @@
+// Joins this project to the hive as a node (run `hive up` first).
+// VS Code / Cursor: "Dev Containers: Reopen in Container".
+{
+	"name": "hive: ${localWorkspaceFolderBasename}",
+	"image": "hive/node",
+	"runArgs": [
+		"--name=hive-${localWorkspaceFolderBasename}",
+		"--hostname=${localWorkspaceFolderBasename}",
+		"--network=hive-net",
+		"--label=hive.role=node",
+		"--label=hive.name=${localWorkspaceFolderBasename}",
+		"--label=hive.parent=root"
+	],
+	"remoteUser": "dev",
+	"workspaceMount": "source=${localWorkspaceFolder},target=/workspace,type=bind",
+	"workspaceFolder": "/workspace",
+	"mounts": [
+		"source=hive-shared,target=/shared,type=volume",
+		"source=hive-claude,target=/home/dev/.claude,type=volume"
+	],
+	"containerEnv": {
+		"HIVE_PROXY": "http://bridge:3128",
+		"HTTP_PROXY": "http://bridge:3128",
+		"HTTPS_PROXY": "http://bridge:3128",
+		"http_proxy": "http://bridge:3128",
+		"https_proxy": "http://bridge:3128",
+		"NO_PROXY": "localhost,127.0.0.1,bridge",
+		"no_proxy": "localhost,127.0.0.1,bridge"
+	}
+}
