@@ -14,6 +14,7 @@ HOSTD_PORT=8765                                   # node-facing port on the brid
 HOSTD_MAC_PORT=${HIVE_HOSTD_MAC_PORT:-8799}       # the Mac daemon's port (change if it collides)
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+HIVE_SELF="$script_dir/$(basename "${BASH_SOURCE[0]}")"
 HIVE_HOME="${HIVE_HOME:-$(dirname "$script_dir")}"
 # Inside the root container the CLI is bind-mounted at /usr/local/bin/hive but
 # the repo lives at /workspace — so hive runs as the in-container control plane.
@@ -777,7 +778,49 @@ inject_read_token() {
     mv "$f.tmp" "$f"
     git config --global credential.helper store
   '
-  echo "  read-all token injected (read-only, ~1h; refresh: hive <node> token)"
+  # remember this node + keep its token fresh forever (App tokens expire in ~1h)
+  local nm=${c#$PREFIX}
+  mkdir -p "$(dirname "$READ_NODES_FILE")"; touch "$READ_NODES_FILE"
+  grep -qxF "$nm" "$READ_NODES_FILE" 2>/dev/null || printf '%s\n' "$nm" >> "$READ_NODES_FILE"
+  ensure_token_daemon
+  echo "  read-all token injected (auto-refreshed; read-only)"
+}
+
+READ_NODES_FILE="$HOME/.config/hive/read-nodes"
+TOKEN_DAEMON_PID="$HOME/.config/hive/token-daemon.pid"
+
+ensure_token_daemon() {
+  [ -f "$TOKEN_DAEMON_PID" ] && kill -0 "$(cat "$TOKEN_DAEMON_PID")" 2>/dev/null && return 0
+  cmd_token start >/dev/null 2>&1 || true
+}
+
+# Effectively-unlimited read-all: a background loop re-mints + re-injects every
+# 45 min (GitHub caps each token at ~1h). Auto-starts on first read-token use.
+cmd_token() {
+  local sub=${1:-status}
+  case $sub in
+    refresh)
+      [ -f "$READ_NODES_FILE" ] || return 0
+      while read -r n; do
+        [ -n "$n" ] || continue
+        docker container inspect "$PREFIX$n" >/dev/null 2>&1 && inject_read_token "$PREFIX$n" >/dev/null 2>&1 || true
+      done < "$READ_NODES_FILE" ;;
+    start)
+      mkdir -p "$(dirname "$TOKEN_DAEMON_PID")"
+      if [ -f "$TOKEN_DAEMON_PID" ] && kill -0 "$(cat "$TOKEN_DAEMON_PID")" 2>/dev/null; then
+        echo "token refresher already running"; return 0; fi
+      nohup bash -c 'while true; do sleep 2700; "$0" token refresh >/dev/null 2>&1; done' "$HIVE_SELF" >/dev/null 2>&1 &
+      echo $! > "$TOKEN_DAEMON_PID"
+      echo "token refresher started (re-mints read-all tokens every 45m)" ;;
+    stop)
+      [ -f "$TOKEN_DAEMON_PID" ] && kill "$(cat "$TOKEN_DAEMON_PID")" 2>/dev/null || true
+      rm -f "$TOKEN_DAEMON_PID"; echo "token refresher stopped" ;;
+    status)
+      if [ -f "$TOKEN_DAEMON_PID" ] && kill -0 "$(cat "$TOKEN_DAEMON_PID")" 2>/dev/null; then
+        echo "token refresher: running (pid $(cat "$TOKEN_DAEMON_PID"))  nodes: $([ -f "$READ_NODES_FILE" ] && tr '\n' ' ' < "$READ_NODES_FILE")"
+      else echo "token refresher: stopped"; fi ;;
+    *) die "usage: hive token start|stop|status" ;;
+  esac
 }
 
 # Install a token into one container: git credential helper (HTTPS) + gh CLI.
@@ -963,6 +1006,7 @@ case $cmd in
   join)          cmd_join "$@" ;;
   ssh)           cmd_ssh "$@" ;;
   github)        cmd_github "$@" ;;
+  token)         cmd_token "$@" ;;
   hostd)         cmd_hostd "$@" ;;
   bridge)        cmd_bridge "$@" ;;
   devcontainer)  cmd_devcontainer "$@" ;;
