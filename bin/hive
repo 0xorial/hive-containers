@@ -351,6 +351,22 @@ bridge_open_set() {
   ' _ "$1" "$2"
 }
 
+# Retract a node's hive-net source IP from the bridge's live open set AND the
+# persisted open-nodes list — BEFORE the container is removed, while its IP can
+# still be resolved. Without this, an opened node's IP lingers as "full
+# internet"; Docker later hands the same IP to a fresh node, silently
+# un-sealing it. Quiet by design; callers print their own status.
+seal_before_remove() {
+  local c=$1 ip
+  ip=$(node_hive_ip "$c") || return 0
+  [ -n "$ip" ] || return 0
+  if [ -f "$OPEN_NODES_FILE" ] && grep -qxF "$ip" "$OPEN_NODES_FILE" 2>/dev/null; then
+    grep -vxF "$ip" "$OPEN_NODES_FILE" > "$OPEN_NODES_FILE.tmp" 2>/dev/null || true
+    mv "$OPEN_NODES_FILE.tmp" "$OPEN_NODES_FILE" 2>/dev/null || true
+  fi
+  if node_is_open "$c"; then bridge_open_set "$ip" del; fi
+}
+
 # net on/off changes only the bridge's policy for this node's source IP — the
 # node's environment never changes, so it takes effect on the next request
 # (instant, even for a shell that was already open). The curated open-nodes
@@ -527,6 +543,7 @@ cmd_rm() {
   local n
   for n in "${names[@]}"; do
     if [ "$n" = root ] || [ "$n" = bridge ]; then die "root/bridge are managed by 'hive up/down'"; fi
+    seal_before_remove "$PREFIX$n"   # retract any net-on IP before it can be reused
     docker rm -f "$PREFIX$n" >/dev/null
     echo "removed $n"
     if [ "$purge" = 1 ]; then
