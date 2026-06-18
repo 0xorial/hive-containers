@@ -333,9 +333,12 @@ cmd_new() {
   # absent). Recreate (HIVE_RECREATE=1) reuses --bind but must NOT re-onboard.
   local project=0
   if [ -n "$bind" ]; then
+    # accept ~, relative, and absolute; resolve to an absolute path
     case $bind in
-      /*) ;;
-      *) die "--bind needs an absolute Mac path" ;;
+      '~')   bind="$HOME" ;;
+      '~/'*) bind="$HOME/${bind#'~/'}" ;;
+      /*)    ;;
+      *)     bind="$PWD/$bind" ;;
     esac
     [ -e "$bind" ] || mkdir -p "$bind"
     [ "${HIVE_RECREATE:-}" = 1 ] || project=1
