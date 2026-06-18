@@ -1,17 +1,13 @@
 #!/usr/bin/env bash
-# hive — hierarchical Claude Code containers with a curated bridge to the host.
+# hive — hierarchical Claude Code containers on a shared Docker engine.
 set -euo pipefail
 
 PREFIX=hive-
 NET=hive-net
-UPLINK=hive-uplink
-PROXY=http://bridge:3128
-NO_PROXY_LIST=localhost,127.0.0.1,bridge
 NODE_IMAGE=${HIVE_NODE_IMAGE:-hive/node}
 DEV_IMAGE=${HIVE_DEV_IMAGE:-hive/dev}
 HOSTD_TOKEN_FILE="$HOME/.config/hive/hostd-token"
-HOSTD_PORT=8765                                   # node-facing port on the bridge (inside hive-net)
-HOSTD_MAC_PORT=${HIVE_HOSTD_MAC_PORT:-8799}       # the Mac daemon's port (change if it collides)
+HOSTD_MAC_PORT=${HIVE_HOSTD_MAC_PORT:-8799}       # Mac daemon port; nodes reach it at host.docker.internal:<port>
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HIVE_SELF="$script_dir/$(basename "${BASH_SOURCE[0]}")"
@@ -58,14 +54,14 @@ tty_flags() {
 
 usage() {
   cat <<'EOF'
-hive — hierarchical Claude Code containers with a curated bridge to your Mac
+hive — hierarchical Claude Code containers on a shared Docker engine
 
 lifecycle
   hive build                       build/rebuild all images
-  hive up                          start root + bridge (builds if needed)
-  hive down                        stop nodes, take down root + bridge
+  hive up                          start root (builds if needed)
+  hive down                        stop nodes, take down root
   hive status                      what's running
-  hive doctor                      verify isolation, proxy, and host bridge
+  hive doctor                      verify the engine + control plane
 
 nodes
   hive new <name> [opts] [-- docker-run-args]
@@ -73,24 +69,22 @@ nodes
        --bind <abs-path>           bind-mount a Mac dir as /workspace
                                    (default: named volume hive-ws-<name>)
        --image <img>               alternate image (default: hive/node)
-       --uplink                    also give direct internet + published ports
   hive ls                          list containers + guests on hive-net
   hive tree                        show the hierarchy
   hive sh [name] [cmd...]          shell into a node (default: root)
   hive claude <name> [args...]     run claude in a node (e.g. -p "fix tests")
   hive rm <name>... [--purge]      remove node(s); --purge drops claude+dind volumes (workspace volume is always kept)
-  hive join <container> [--uplink] attach an existing container to the hive network
+  hive join <container>            attach an existing container to the hive network
 
 per-node switches (live — applied to the running container, no recreate)
-  hive <node> net on|off|status        full internet on/off for one node
   hive <node> github on|off|status     give/remove your github token for one node
   hive <node> host on|off|status       let this node run commands on your Mac
   hive <node> dind on|off|status       nested docker engine (recreates the node)
-  hive <node> status                   show net + github + host + dind state
+  hive <node> status                   show github + host + dind state
   hive <node> sh|claude [...]          same as 'hive sh <node>' / 'hive claude <node>'
 
 run commands on the Mac from a node (deliberate, opt-in hole)
-  hive hostd start|stop|status|logs    the Mac-side daemon + bridge forward
+  hive hostd start|stop|status|logs    the Mac-side daemon
   hive <node> host on                  then, inside the node:  host <command>
   hive new <name> --host               sugar for: new + host on
 
@@ -105,11 +99,6 @@ private github (no token pasting — hive logs you in once)
   hive <node> github off           remove the token from <node>
   hive github login                (re)run the GitHub login and cache the token
   hive github --forget             delete the cached token
-
-bridge (curated in config/)
-  hive bridge reload               apply config/egress-allowlist.txt + forwards.conf
-  hive bridge logs [-f]            proxy/forward logs
-  hive bridge conf                 show the generated proxy config
 
 devcontainers
   hive devcontainer <project-dir>  drop a .devcontainer that joins the hive
@@ -142,7 +131,7 @@ cmd_up() {
   echo "  hive sh root          # shell in the control plane"
   echo "  hive claude root      # claude in the control plane (own login; creds are per-node)"
   echo "  hive new <name>       # spawn a node"
-  echo "  hive doctor           # verify isolation + bridge"
+  echo "  hive doctor           # verify the engine + control plane"
 }
 
 cmd_down() {
@@ -180,7 +169,7 @@ filler. Result first; expand only if asked.
 ## Git
 - Commit often — small commits after each meaningful change.
 - \`origin\` is a private GitHub repo; this container holds a write **deploy key**,
-  so \`git push\` works (over SSH, needs net on).
+  so \`git push\` works (over SSH).
 
 ## Memory
 Maintain \`.hive/history.md\` (committed): a bounded \`## Consolidated\` summary +
@@ -265,20 +254,19 @@ EOSH
 }
 
 cmd_new() {
-  if [ $# -lt 1 ]; then die "usage: hive new <name> [--parent p] [--bind dir] [--image img] [--uplink] [-- docker args]"; fi
+  if [ $# -lt 1 ]; then die "usage: hive new <name> [--parent p] [--bind dir] [--image img] [-- docker args]"; fi
   local name=$1; shift
   if ! [[ "$name" =~ ^[a-z0-9][a-z0-9_-]*$ ]]; then
     die "name must be lowercase alphanumeric plus '-' or '_'"
   fi
 
-  local parent=root bind="" image=$NODE_IMAGE uplink=0 host=0 dind=0 image_set=0
+  local parent=root bind="" image=$NODE_IMAGE host=0 dind=0 image_set=0
   local extra=()
   while [ $# -gt 0 ]; do
     case $1 in
       --parent) parent=$2; shift 2 ;;
       --bind)   bind=$2;   shift 2 ;;
       --image)  image=$2; image_set=1; shift 2 ;;
-      --uplink) uplink=1;  shift ;;
       --host)   host=1;    shift ;;
       --dind)   dind=1;    shift ;;
       --) shift; extra=("$@"); break ;;
@@ -300,13 +288,8 @@ cmd_new() {
     note "warning: parent '$parent' has no container yet — tree will show '$name' as detached"
   fi
 
-  local netflag=$NET
-  if [ "$uplink" = 1 ]; then
-    # Create on the uplink so published ports (-p) work, then join the hive net.
-    netflag=$UPLINK
-  fi
-
-  local args=(-d --init --name "$PREFIX$name" --hostname "$name" --network "$netflag"
+  local args=(-d --init --name "$PREFIX$name" --hostname "$name" --network "$NET"
+    --add-host host.docker.internal:host-gateway
     --restart unless-stopped
     --label hive.role=node --label "hive.name=$name" --label "hive.parent=$parent"
     -e "HIVE_NAME=$name" -e "HIVE_PARENT=$parent"
@@ -347,32 +330,20 @@ cmd_new() {
     args+=(-v /var/run/docker.sock:/var/run/docker.sock)
   fi
 
-  if [ "$uplink" = 0 ]; then
-    args+=(-e "HIVE_PROXY=$PROXY"
-      -e "HTTP_PROXY=$PROXY"  -e "http_proxy=$PROXY"
-      -e "HTTPS_PROXY=$PROXY" -e "https_proxy=$PROXY"
-      -e "NO_PROXY=$NO_PROXY_LIST" -e "no_proxy=$NO_PROXY_LIST")
-  fi
-
   docker run "${args[@]}" "${extra[@]}" "$image" >/dev/null
-  if [ "$uplink" = 1 ]; then
-    docker network connect "$NET" "$PREFIX$name"
-  fi
   if [ -f "$HOME/.ssh/hive_ed25519.pub" ]; then
     inject_ssh_key "$PREFIX$name" || note "warning: could not install ssh key in $name"
   fi
   # --host is sugar: create, then turn the live host switch on
   if [ "$host" = 1 ]; then cmd_node_host "$name" on; fi
-  # project node: internet on, then scaffold/adopt git + GitHub
+  # project node: scaffold/adopt git + GitHub (nodes have internet by default)
   if [ "$project" = 1 ]; then
-    cmd_node_net "$name" on >/dev/null 2>&1 || note "could not enable net for $name"
     setup_project "$name" "$fresh"
   fi
   echo "node '$name' up (parent: $parent)."
   if [ "$dind" = 1 ]; then echo "  (nested dockerd starting — 'docker ps' inside works in a few seconds)"; fi
   echo "  hive sh $name            # shell"
   echo "  hive claude $name        # claude"
-  echo "  hive $name net on        # give it full internet"
   echo "  hive $name github on     # give it your github token"
 }
 
@@ -406,11 +377,9 @@ cmd_tree() {
     done <<<"$rows"
   }
 
-  local rootstate bridgestate
+  local rootstate
   rootstate=$(docker inspect -f '{{.State.Status}}' "${PREFIX}root" 2>/dev/null || echo absent)
-  bridgestate=$(docker inspect -f '{{.State.Status}}' "${PREFIX}bridge" 2>/dev/null || echo absent)
   echo "root [$rootstate]"
-  echo "├─ (bridge) [$bridgestate] — curated egress + host forwards"
   print_children root ""
 
   local name p state orphans=""
@@ -443,83 +412,6 @@ cmd_claude() {
 
 # ---------------- per-node switches ----------------
 
-OPEN_NODES_FILE="$HIVE_HOME/config/open-nodes"
-
-# This node's IP on the sealed hive network (what the bridge sees as the source).
-node_hive_ip() {
-  docker inspect -f '{{with index .NetworkSettings.Networks "'"$NET"'"}}{{.IPAddress}}{{end}}' "$1" 2>/dev/null
-}
-
-# Is this node in the bridge's live open set? (the bridge is authoritative)
-node_is_open() {
-  local ip; ip=$(node_hive_ip "$1")
-  [ -n "$ip" ] && docker exec "${PREFIX}bridge" grep -qxF "$ip" /run/hive/open 2>/dev/null
-}
-
-# Add/remove the node's source IP in the bridge's live open set + reconfigure
-# squid. Updated directly in the running bridge (no mount round-trip), so it's
-# race-free and instant. $1=ip, $2=add|del
-bridge_open_set() {
-  docker exec "${PREFIX}bridge" sh -c '
-    ip="$1"; op="$2"; f=/run/hive/open
-    if [ "$op" = add ]; then
-      grep -qxF "$ip" "$f" 2>/dev/null || echo "$ip" >> "$f"
-    else
-      grep -vxF "$ip" "$f" > "$f.tmp" 2>/dev/null || true
-      mv "$f.tmp" "$f"
-    fi
-    chown squid:squid "$f" 2>/dev/null || true
-    squid -k reconfigure -f /run/hive/squid.conf 2>/dev/null || pkill -HUP squid 2>/dev/null || true
-  ' _ "$1" "$2"
-}
-
-# Retract a node's hive-net source IP from the bridge's live open set AND the
-# persisted open-nodes list — BEFORE the container is removed, while its IP can
-# still be resolved. Without this, an opened node's IP lingers as "full
-# internet"; Docker later hands the same IP to a fresh node, silently
-# un-sealing it. Quiet by design; callers print their own status.
-seal_before_remove() {
-  local c=$1 ip
-  ip=$(node_hive_ip "$c") || return 0
-  [ -n "$ip" ] || return 0
-  if [ -f "$OPEN_NODES_FILE" ] && grep -qxF "$ip" "$OPEN_NODES_FILE" 2>/dev/null; then
-    grep -vxF "$ip" "$OPEN_NODES_FILE" > "$OPEN_NODES_FILE.tmp" 2>/dev/null || true
-    mv "$OPEN_NODES_FILE.tmp" "$OPEN_NODES_FILE" 2>/dev/null || true
-  fi
-  if node_is_open "$c"; then bridge_open_set "$ip" del; fi
-}
-
-# net on/off changes only the bridge's policy for this node's source IP — the
-# node's environment never changes, so it takes effect on the next request
-# (instant, even for a shell that was already open). The curated open-nodes
-# file is kept in sync so the state survives a bridge restart.
-cmd_node_net() {
-  local node=$1 action=${2:-status} c="$PREFIX$1" ip
-  docker container inspect "$c" >/dev/null 2>&1 || die "no such node: $node"
-  ip=$(node_hive_ip "$c")
-  case $action in
-    on|open)
-      [ -n "$ip" ] || die "$node has no $NET address"
-      if node_is_open "$c"; then echo "net: already ON for $node"; return; fi
-      bridge_open_set "$ip" add
-      touch "$OPEN_NODES_FILE"; printf '%s\n' "$ip" >> "$OPEN_NODES_FILE"
-      echo "net: ON for $node ($ip) — full internet, effective immediately"
-      ;;
-    off|seal|close)
-      bridge_open_set "$ip" del
-      if [ -f "$OPEN_NODES_FILE" ]; then
-        grep -vxF "$ip" "$OPEN_NODES_FILE" > "$OPEN_NODES_FILE.tmp" 2>/dev/null || true
-        mv "$OPEN_NODES_FILE.tmp" "$OPEN_NODES_FILE"
-      fi
-      echo "net: OFF for $node — sealed again (egress only via the bridge allowlist)"
-      ;;
-    status)
-      if node_is_open "$c"; then echo "net:    ON  ($node — full internet via the bridge)"
-      else echo "net:    OFF ($node — sealed to the allowlist)"; fi ;;
-    *) die "usage: hive $node net on|off|status" ;;
-  esac
-}
-
 cmd_node_github() {
   local node=$1 action=${2:-status} c="$PREFIX$1"
   docker container inspect "$c" >/dev/null 2>&1 || die "no such node: $node"
@@ -539,8 +431,8 @@ cmd_node_github() {
 }
 
 # host on/off is a LIVE toggle: the capability is a secret token injected into
-# (or removed from) the running node via docker exec — no recreate, like net
-# and github. `hive new --host` is just sugar for this.
+# (or removed from) the running node via docker exec — no recreate, like
+# github. `hive new --host` is just sugar for this.
 cmd_node_host() {
   local node=$1 action=${2:-status} c="$PREFIX$1"
   docker container inspect "$c" >/dev/null 2>&1 || die "no such node: $node"
@@ -549,8 +441,8 @@ cmd_node_host() {
       [ -f "$HOSTD_TOKEN_FILE" ] || die "no host daemon yet — run: hive hostd start"
       docker exec -i -u dev "$c" sh -c 'mkdir -p ~/.config/hive && umask 077 && cat > ~/.config/hive/hostd-token' < "$HOSTD_TOKEN_FILE"
       echo "host: ON for $node — it can now run Mac commands with: host <cmd>"
-      docker exec "${PREFIX}bridge" pgrep -f "TCP-LISTEN:$HOSTD_PORT" >/dev/null 2>&1 \
-        || note "the daemon/forward isn't up yet — run: hive hostd start" ;;
+      curl -fsS -m 3 "http://127.0.0.1:$HOSTD_MAC_PORT/health" >/dev/null 2>&1 \
+        || note "the Mac daemon isn't up yet — run: hive hostd start" ;;
     off)
       docker exec -u dev "$c" rm -f /home/dev/.config/hive/hostd-token 2>/dev/null || true
       echo "host: OFF for $node (token removed)" ;;
@@ -564,24 +456,20 @@ cmd_node_host() {
 
 # dind needs --privileged, a creation-time capability — so toggling it on a
 # running node transparently recreates it, preserving the workspace and the
-# net/github/host state (the container fs is rebuilt from the image).
+# github/host state (the container fs is rebuilt from the image).
 # Recreate a node from the current image, preserving workspace (bind/volume),
-# parent, and net/github/host state. Volumes reattach; container fs is fresh.
+# parent, and github/host state. Volumes reattach; container fs is fresh.
 # $1=node, $2=desired dind (0/1). HIVE_RECREATE stops cmd_new re-onboarding.
 recreate_node() {
-  local node=$1 want_dind=$2 c="$PREFIX$1" parent bind image uplink=0 neton=0 githubon=0 hoston=0
+  local node=$1 want_dind=$2 c="$PREFIX$1" parent bind image githubon=0 hoston=0
   parent=$(docker inspect -f '{{index .Config.Labels "hive.parent"}}' "$c")
   bind=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/workspace"}}{{if eq .Type "bind"}}{{.Source}}{{end}}{{end}}{{end}}' "$c")
   image=$(docker inspect -f '{{.Config.Image}}' "$c")
-  if [ "$(docker inspect -f '{{with index .NetworkSettings.Networks "'"$UPLINK"'"}}1{{end}}' "$c" 2>/dev/null)" = 1 ]; then uplink=1; fi
-  if node_is_open "$c"; then neton=1; fi
   if docker exec -u dev "$c" test -f /home/dev/.git-credentials 2>/dev/null; then githubon=1; fi
   if docker exec -u dev "$c" test -f /home/dev/.config/hive/hostd-token 2>/dev/null; then hoston=1; fi
-  seal_before_remove "$c"
   docker rm -f "$c" >/dev/null
   local nargs=(--parent "$parent")
   if [ -n "$bind" ]; then nargs+=(--bind "$bind"); fi
-  if [ "$uplink" = 1 ]; then nargs+=(--uplink); fi
   # preserve a custom image; the default node/dev images are left to track --dind
   if [ -n "$image" ] && [ "$image" != "$NODE_IMAGE" ] && [ "$image" != "$DEV_IMAGE" ]; then
     nargs+=(--image "$image")
@@ -590,7 +478,6 @@ recreate_node() {
   # NOTE: raw `-- <docker run args>` from the original `hive new` are not replayed
   # here (they can't be recovered from `docker inspect`).
   HIVE_RECREATE=1; cmd_new "$node" "${nargs[@]}" >/dev/null; unset HIVE_RECREATE
-  if [ "$neton" = 1 ]; then cmd_node_net "$node" on >/dev/null; fi
   if [ "$githubon" = 1 ]; then cmd_node_github "$node" on >/dev/null; fi
   if [ "$hoston" = 1 ]; then cmd_node_host "$node" on >/dev/null; fi
 }
@@ -599,7 +486,7 @@ cmd_node_recreate() {
   local node=$1 c="$PREFIX$1" d=0
   docker container inspect "$c" >/dev/null 2>&1 || die "no such node: $node"
   if docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$c" | grep -qx 'HIVE_DIND=1'; then d=1; fi
-  note "recreating $node from the current image (workspace + volumes + net/github/host preserved)…"
+  note "recreating $node from the current image (workspace + volumes + github/host preserved)…"
   recreate_node "$node" "$d"
   echo "recreated $node"
 }
@@ -616,7 +503,7 @@ cmd_node_dind() {
       local want=0; if [ "$action" = on ]; then want=1; fi
       note "recreating $node to turn dind $action (workspace + state preserved)…"
       recreate_node "$node" "$want"
-      echo "dind: $action for $node (recreated; workspace, net, github, host preserved)" ;;
+      echo "dind: $action for $node (recreated; workspace, github, host preserved)" ;;
     *) die "usage: hive $node dind on|off|status" ;;
   esac
 }
@@ -625,7 +512,6 @@ cmd_node_status() {
   local node=$1 c="$PREFIX$1"
   docker container inspect "$c" >/dev/null 2>&1 || die "no such node: $node"
   echo "$node:"
-  cmd_node_net "$node" status
   cmd_node_github "$node" status
   cmd_node_host "$node" status
   cmd_node_dind "$node" status
@@ -655,24 +541,18 @@ cmd_hostd() {
         fi
         echo "hostd running on Mac:$HOSTD_MAC_PORT (pid $(cat "$pidf")) — logs: hive hostd logs"
       fi
-      # bridge forwards its fixed node-facing port to the Mac daemon's port
-      docker exec "${PREFIX}bridge" pkill -f "TCP-LISTEN:$HOSTD_PORT" 2>/dev/null || true
-      docker exec -d "${PREFIX}bridge" socat "TCP-LISTEN:$HOSTD_PORT,fork,reuseaddr" "TCP:host.docker.internal:$HOSTD_MAC_PORT"
-      echo "bridge forward bridge:$HOSTD_PORT -> Mac:$HOSTD_MAC_PORT"
+      echo "nodes reach it directly at host.docker.internal:$HOSTD_MAC_PORT"
       echo "now bless nodes:  hive <node> host on"
       ;;
     stop)
       if [ -f "$pidf" ]; then kill "$(cat "$pidf")" 2>/dev/null || true; rm -f "$pidf"; fi
       pkill -f "$daemon" 2>/dev/null || true
-      docker exec "${PREFIX}bridge" pkill -f "TCP-LISTEN:$HOSTD_PORT" 2>/dev/null || true
       echo "hostd stopped"
       ;;
     status)
       if curl -fsS -m 3 "http://127.0.0.1:$HOSTD_MAC_PORT/health" >/dev/null 2>&1; then
         echo "hostd: running (Mac:$HOSTD_MAC_PORT)"
       else echo "hostd: stopped"; fi
-      docker exec "${PREFIX}bridge" pgrep -f "TCP-LISTEN:$HOSTD_PORT" >/dev/null 2>&1 \
-        && echo "bridge forward: up (bridge:$HOSTD_PORT -> Mac:$HOSTD_MAC_PORT)" || echo "bridge forward: down"
       ;;
     logs)
       tail -n "${2:-40}" "$logf" 2>/dev/null || echo "(no log yet)" ;;
@@ -691,8 +571,7 @@ cmd_rm() {
   if [ ${#names[@]} -lt 1 ]; then die "usage: hive rm <name>... [--purge]"; fi
   local n
   for n in "${names[@]}"; do
-    if [ "$n" = root ] || [ "$n" = bridge ]; then die "root/bridge are managed by 'hive up/down'"; fi
-    seal_before_remove "$PREFIX$n"   # retract any net-on IP before it can be reused
+    if [ "$n" = root ]; then die "root is managed by 'hive up/down'"; fi
     docker rm -f "$PREFIX$n" >/dev/null
     echo "removed $n"
     if [ "$purge" = 1 ]; then
@@ -711,14 +590,10 @@ cmd_rm() {
 }
 
 cmd_join() {
-  if [ $# -lt 1 ]; then die "usage: hive join <container> [--uplink]"; fi
-  local target=$1; shift
+  if [ $# -lt 1 ]; then die "usage: hive join <container>"; fi
+  local target=$1
   docker network connect "$NET" "$target"
-  if [ "${1:-}" = "--uplink" ]; then
-    docker network connect "$UPLINK" "$target"
-  fi
-  echo "joined '$target' to $NET (shows under guests in 'hive ls';"
-  echo "set HTTP(S)_PROXY=$PROXY inside it to use the bridge)"
+  echo "joined '$target' to $NET (shows under guests in 'hive ls')"
 }
 
 # ---------------- ssh (desktop app / IDE access) ----------------
@@ -773,15 +648,15 @@ EOF
   mv "$cfg.tmp" "$cfg" && chmod 600 "$cfg"
   echo "updated ~/.ssh/config (managed block: Host ${PREFIX}*)"
 
-  # 3. install the key in every running hive container except the bridge
-  local c role installed=0
-  while read -r c role; do
-    if [ -z "$c" ] || [ "$role" = bridge ]; then continue; fi
+  # 3. install the key in every running hive container
+  local c installed=0
+  while read -r c; do
+    if [ -z "$c" ]; then continue; fi
     if inject_ssh_key "$c" 2>/dev/null; then
       installed=$((installed + 1))
       echo "  key installed in $c"
     fi
-  done < <(docker ps --filter label=hive.role --format '{{.Names}} {{.Label "hive.role"}}')
+  done < <(docker ps --filter label=hive.role --format '{{.Names}}')
   if [ "$installed" = 0 ]; then
     note "no running nodes yet — keys are installed automatically by 'hive new'"
   fi
@@ -907,9 +782,8 @@ store_github_token() {
   ( umask 077; printf '%s' "$1" > "$GH_TOKEN_FILE" )
 }
 
-# Obtain a token for the user via GitHub's device login (run with root's gh,
-# which reaches GitHub through the bridge — the Mac has no gh). One browser
-# approval; the token is cached hive-wide so this never runs again.
+# Obtain a token for the user via GitHub's device login (run with root's gh).
+# One browser approval; the token is cached hive-wide so this never runs again.
 github_login() {
   local runner="${PREFIX}root" token
   docker container inspect "$runner" >/dev/null 2>&1 || die "root must be running first (hive up)"
@@ -954,40 +828,6 @@ cmd_github() {
   esac
 }
 
-# ---------------- bridge ----------------
-
-cmd_bridge() {
-  local sub=${1:-}
-  shift || true
-  case $sub in
-    reload)
-      local since
-      since=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-      docker restart "${PREFIX}bridge" >/dev/null
-      echo "bridge reloaded from $HIVE_HOME/config/"
-      sleep 1
-      docker logs --since "$since" "${PREFIX}bridge" 2>&1 | grep '^bridge:' || true
-      ;;
-    logs)
-      if [ "${1:-}" = "-f" ]; then
-        docker exec "${PREFIX}bridge" tail -f /run/hive/access.log
-      else
-        echo "--- bridge / squid ---"
-        docker logs --tail 40 "${PREFIX}bridge" 2>&1 | grep -iE 'bridge:|FATAL|ERROR|listening' || true
-        echo "--- recent egress (TCP_DENIED = refused by allowlist) ---"
-        docker exec "${PREFIX}bridge" tail -n 50 /run/hive/access.log 2>/dev/null || echo "(no traffic yet)"
-      fi
-      ;;
-    conf)
-      docker exec "${PREFIX}bridge" sh -c \
-        'echo "--- squid.conf ---"; cat /run/hive/squid.conf; echo; echo "--- allowed domains ---"; cat /run/hive/allowed 2>/dev/null; echo; echo "--- open nodes (source IPs) ---"; grep -vx 127.0.0.2 /run/hive/open 2>/dev/null || echo "(none)"'
-      ;;
-    *)
-      die "usage: hive bridge reload|logs|conf"
-      ;;
-  esac
-}
-
 # ---------------- doctor ----------------
 
 check() {
@@ -1004,28 +844,10 @@ cmd_doctor() {
   DOCTOR_FAIL=0
   echo "  engine: ${DOCKER_CONTEXT:-$(docker context show 2>/dev/null || echo default)}"
   echo "  node runtime: ${NODE_RUNTIME:-engine default (runc)}  |  available: $(docker info --format '{{range $k,$v := .Runtimes}}{{$k}} {{end}}' 2>/dev/null)"
-  check "docker daemon reachable"            docker info
-  check "bridge container running"           docker exec "${PREFIX}bridge" true
-  check "root container running"             docker exec "${PREFIX}root" true
-  check "root can drive docker (socket)"     docker exec "${PREFIX}root" docker ps
-  check "bridge resolves host.docker.internal" docker exec "${PREFIX}bridge" getent hosts host.docker.internal
-  check "allowed egress via bridge (api.anthropic.com)" \
-    docker exec "${PREFIX}root" curl -sS -o /dev/null -m 20 https://api.anthropic.com
-
-  if docker exec "${PREFIX}root" curl -sS -o /dev/null -m 10 https://example.com >/dev/null 2>&1; then
-    echo "  FAIL egress filter: example.com was reachable (expected blocked)"
-    DOCTOR_FAIL=1
-  else
-    echo "  ok   egress filter blocks non-allowlisted domains"
-  fi
-
-  if docker exec "${PREFIX}root" curl -sS -o /dev/null -m 5 --noproxy '*' https://api.anthropic.com >/dev/null 2>&1; then
-    echo "  FAIL direct egress possible — hive-net is not isolating"
-    DOCTOR_FAIL=1
-  else
-    echo "  ok   direct egress blocked (internal network)"
-  fi
-
+  check "docker daemon reachable"        docker info
+  check "root container running"         docker exec "${PREFIX}root" true
+  check "root can drive docker (socket)" docker exec "${PREFIX}root" docker ps
+  check "root has internet"              docker exec "${PREFIX}root" curl -sS -o /dev/null -m 20 https://api.anthropic.com
   if [ "$DOCTOR_FAIL" != 0 ]; then
     exit 1
   fi
@@ -1069,7 +891,6 @@ case $cmd in
   github)        cmd_github "$@" ;;
   token)         cmd_token "$@" ;;
   hostd)         cmd_hostd "$@" ;;
-  bridge)        cmd_bridge "$@" ;;
   devcontainer)  cmd_devcontainer "$@" ;;
   help|-h|--help) usage ;;
   *)
@@ -1077,7 +898,6 @@ case $cmd in
     if docker container inspect "$PREFIX$cmd" >/dev/null 2>&1; then
       verb=${1:-status}; shift || true
       case $verb in
-        net)        cmd_node_net    "$cmd" "$@" ;;
         github)     cmd_node_github "$cmd" "$@" ;;
         host)       cmd_node_host   "$cmd" "$@" ;;
         dind)       cmd_node_dind   "$cmd" "$@" ;;
@@ -1089,7 +909,7 @@ case $cmd in
         sh)         cmd_sh          "$cmd" "$@" ;;
         claude)     cmd_claude      "$cmd" "$@" ;;
         status)     cmd_node_status "$cmd" ;;
-        *) die "unknown verb '$verb' for node '$cmd' (net|github|host|dind|repo|token|recreate|sh|claude|status)" ;;
+        *) die "unknown verb '$verb' for node '$cmd' (github|host|dind|repo|token|recreate|sh|claude|status)" ;;
       esac
     else
       echo "hive: unknown command or node: $cmd" >&2

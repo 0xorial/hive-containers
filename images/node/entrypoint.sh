@@ -3,12 +3,6 @@
 set -e
 
 if [ "$(id -u)" -eq 0 ]; then
-  # apt only honors proxies via config, not env vars
-  if [ -n "${HIVE_PROXY:-}" ]; then
-    printf 'Acquire::http::Proxy "%s";\nAcquire::https::Proxy "%s";\n' \
-      "$HIVE_PROXY" "$HIVE_PROXY" > /etc/apt/apt.conf.d/99hive-proxy
-  fi
-
   # Named volumes mount root-owned on first use; hand the top level to dev.
   # (chown is a no-op / may fail on Mac bind mounts — that's fine.)
   for d in /home/dev/.claude /shared /workspace; do
@@ -24,11 +18,6 @@ if [ "$(id -u)" -eq 0 ]; then
   fi
   mkdir -p /run/sshd
   {
-    for var in HIVE_PROXY HTTP_PROXY HTTPS_PROXY http_proxy https_proxy NO_PROXY no_proxy; do
-      if [ -n "${!var:-}" ]; then
-        printf 'export %s=%q\n' "$var" "${!var}"
-      fi
-    done
     printf 'export CLAUDE_CONFIG_DIR=%q\n' "${CLAUDE_CONFIG_DIR:-/home/dev/.claude}"
     printf 'export DISABLE_AUTOUPDATER=1\n'
   } > /etc/hive-env.sh
@@ -49,11 +38,7 @@ if [ "$(id -u)" -eq 0 ]; then
   fi
   mkdir -p /etc/claude-code
 
-  if [ -n "${HTTP_PROXY:-}" ]; then
-    hive_net="All outbound traffic is forced through the hive **bridge** proxy (set in \`HTTP(S)_PROXY\`). Only domains on a curated allowlist resolve — Anthropic, npm, PyPI, GitHub and Debian by default; everything else is refused. A blocked domain or a \"connection refused\" is the allowlist doing its job, not a bug to route around. A service on the user's Mac is reachable only if it's listed in \`config/forwards.conf\`; you then connect to it as \`bridge:<port>\`."
-  else
-    hive_net="This container was started with \`--uplink\`: it has direct internet access and published ports, and is NOT sealed behind the bridge."
-  fi
+  hive_net="This container has normal, direct internet access (no egress proxy or allowlist) and can reach the user's Mac at \`host.docker.internal\`."
 
   if [ "$hive_role" = root ]; then
     hive_parent_line=""
@@ -64,7 +49,6 @@ You hold the Docker socket and the `hive` CLI, and `/workspace` is the hive repo
 - `hive claude <node> -p "..."` — run a task inside a node headlessly and read back its output
 - `hive tree` / `hive ls` — inspect the hierarchy
 - `hive rm <node> --purge` — destroy a node and its workspace
-- To open a domain or a Mac-service forward for the whole hive, edit `config/egress-allowlist.txt` or `config/forwards.conf`, then run `hive bridge reload`.
 
 Do messy or untrusted work in a node you spawn — keep this control plane clean. Pass files to and from nodes through `/shared`.
 EOR
@@ -74,7 +58,7 @@ EOR
 - Parent: **${HIVE_PARENT:-root}**"
     hive_role_para=$(cat <<'EOR'
 ## You are a leaf node
-You cannot see or control other hive containers, and the hive's own config lives in the control plane, not here. If you need a blocked domain opened or a Mac service made reachable, tell the user exactly what you need — they curate it and reload the bridge. Don't try to work around the network limits.
+You cannot see or control other hive containers — the hive's own config lives in the control plane, not here. You have normal, direct internet access; ask the user if you need anything from the control plane.
 EOR
 )
   fi
@@ -82,7 +66,7 @@ EOR
   cat > /etc/claude-code/CLAUDE.md <<EOF
 # hive — where you are
 
-You are Claude Code running inside **${hive_name}**, one container in a *hive*: a tree of sealed dev containers on a single host (a MacBook). The user reaches you through the Claude desktop app or \`hive claude ${hive_name}\`.
+You are Claude Code running inside **${hive_name}**, one container in a *hive*: a tree of dev containers on a single host (a MacBook). The user reaches you through the Claude desktop app or \`hive claude ${hive_name}\`.
 
 ## This container
 - Name: **${hive_name}**${hive_parent_line}

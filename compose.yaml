@@ -2,12 +2,9 @@ name: hive
 
 networks:
   net:
-    # Internal: containers on this network have NO route to the internet or
-    # the Mac. The bridge container is the only way out.
+    # A normal (non-internal) bridge network: containers have direct internet
+    # and reach the Mac via host.docker.internal. No curated egress bridge.
     name: hive-net
-    internal: true
-  uplink:
-    name: hive-uplink
 
 volumes:
   shared:
@@ -18,34 +15,7 @@ volumes:
     # hive — each container logs in on its own.
     name: hive-claude-root
 
-x-proxy-env: &proxy-env
-  HIVE_PROXY: http://bridge:3128
-  HTTP_PROXY: http://bridge:3128
-  HTTPS_PROXY: http://bridge:3128
-  http_proxy: http://bridge:3128
-  https_proxy: http://bridge:3128
-  NO_PROXY: localhost,127.0.0.1,bridge
-  no_proxy: localhost,127.0.0.1,bridge
-
 services:
-  bridge:
-    build:
-      context: .
-      dockerfile: images/bridge/Dockerfile
-    image: hive/bridge
-    container_name: hive-bridge
-    hostname: bridge
-    restart: unless-stopped
-    labels:
-      hive.role: bridge
-      hive.name: bridge
-      hive.parent: root
-    networks: [net, uplink]
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-    volumes:
-      - ./config:/etc/hive:ro
-
   root:
     build:
       context: .
@@ -59,10 +29,10 @@ services:
       hive.role: root
       hive.name: root
     networks: [net]
-    environment: *proxy-env
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - shared:/shared
       - claude:/home/dev/.claude
       - ./:/workspace
-    depends_on: [bridge]
