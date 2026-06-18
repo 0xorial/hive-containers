@@ -78,7 +78,7 @@ nodes
   hive tree                        show the hierarchy
   hive sh [name] [cmd...]          shell into a node (default: root)
   hive claude <name> [args...]     run claude in a node (e.g. -p "fix tests")
-  hive rm <name>... [--purge]      remove node(s); --purge also deletes workspace volume
+  hive rm <name>... [--purge]      remove node(s); --purge drops claude+dind volumes (workspace volume is always kept)
   hive join <container> [--uplink] attach an existing container to the hive network
 
 per-node switches (live — applied to the running container, no recreate)
@@ -671,14 +671,15 @@ cmd_rm() {
     docker rm -f "$PREFIX$n" >/dev/null
     echo "removed $n"
     if [ "$purge" = 1 ]; then
-      if docker volume rm "hive-ws-$n" >/dev/null 2>&1; then
-        echo "purged volume hive-ws-$n"
-      fi
+      # NEVER delete the workspace volume — that's the user's data.
       if docker volume rm "hive-dind-$n" >/dev/null 2>&1; then
         echo "purged volume hive-dind-$n"
       fi
       if docker volume rm "hive-claude-$n" >/dev/null 2>&1; then
         echo "purged volume hive-claude-$n"
+      fi
+      if docker volume inspect "hive-ws-$n" >/dev/null 2>&1; then
+        echo "kept workspace volume hive-ws-$n (remove manually if you truly want it gone)"
       fi
     fi
   done
