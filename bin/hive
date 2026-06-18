@@ -551,6 +551,35 @@ cmd_node_host() {
 # dind needs --privileged, a creation-time capability — so toggling it on a
 # running node transparently recreates it, preserving the workspace and the
 # net/github/host state (the container fs is rebuilt from the image).
+# Recreate a node from the current image, preserving workspace (bind/volume),
+# parent, and net/github/host state. Volumes reattach; container fs is fresh.
+# $1=node, $2=desired dind (0/1). HIVE_RECREATE stops cmd_new re-onboarding.
+recreate_node() {
+  local node=$1 want_dind=$2 c="$PREFIX$1" parent bind neton=0 githubon=0 hoston=0
+  parent=$(docker inspect -f '{{index .Config.Labels "hive.parent"}}' "$c")
+  bind=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/workspace"}}{{if eq .Type "bind"}}{{.Source}}{{end}}{{end}}{{end}}' "$c")
+  if node_is_open "$c"; then neton=1; fi
+  if docker exec -u dev "$c" test -f /home/dev/.git-credentials 2>/dev/null; then githubon=1; fi
+  if docker exec -u dev "$c" test -f /home/dev/.config/hive/hostd-token 2>/dev/null; then hoston=1; fi
+  docker rm -f "$c" >/dev/null
+  local nargs=(--parent "$parent")
+  if [ -n "$bind" ]; then nargs+=(--bind "$bind"); fi
+  if [ "$want_dind" = 1 ]; then nargs+=(--dind); fi
+  HIVE_RECREATE=1; cmd_new "$node" "${nargs[@]}" >/dev/null; unset HIVE_RECREATE
+  if [ "$neton" = 1 ]; then cmd_node_net "$node" on >/dev/null; fi
+  if [ "$githubon" = 1 ]; then cmd_node_github "$node" on >/dev/null; fi
+  if [ "$hoston" = 1 ]; then cmd_node_host "$node" on >/dev/null; fi
+}
+
+cmd_node_recreate() {
+  local node=$1 c="$PREFIX$1" d=0
+  docker container inspect "$c" >/dev/null 2>&1 || die "no such node: $node"
+  if docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$c" | grep -qx 'HIVE_DIND=1'; then d=1; fi
+  note "recreating $node from the current image (workspace + volumes + net/github/host preserved)…"
+  recreate_node "$node" "$d"
+  echo "recreated $node"
+}
+
 cmd_node_dind() {
   local node=$1 action=${2:-status} c="$PREFIX$1"
   docker container inspect "$c" >/dev/null 2>&1 || die "no such node: $node"
@@ -560,21 +589,9 @@ cmd_node_dind() {
         echo "dind:   ON  ($node has a nested docker engine)"
       else echo "dind:   OFF ($node)"; fi ;;
     on|off)
-      local parent bind neton=0 githubon=0 hoston=0
-      parent=$(docker inspect -f '{{index .Config.Labels "hive.parent"}}' "$c")
-      bind=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/workspace"}}{{if eq .Type "bind"}}{{.Source}}{{end}}{{end}}{{end}}' "$c")
-      if node_is_open "$c"; then neton=1; fi
-      if docker exec -u dev "$c" test -f /home/dev/.git-credentials 2>/dev/null; then githubon=1; fi
-      if docker exec -u dev "$c" test -f /home/dev/.config/hive/hostd-token 2>/dev/null; then hoston=1; fi
+      local want=0; if [ "$action" = on ]; then want=1; fi
       note "recreating $node to turn dind $action (workspace + state preserved)…"
-      docker rm -f "$c" >/dev/null
-      local nargs=(--parent "$parent")
-      if [ -n "$bind" ]; then nargs+=(--bind "$bind"); fi
-      if [ "$action" = on ]; then nargs+=(--dind); fi
-      HIVE_RECREATE=1; cmd_new "$node" "${nargs[@]}" >/dev/null; unset HIVE_RECREATE
-      if [ "$neton" = 1 ]; then cmd_node_net "$node" on >/dev/null; fi
-      if [ "$githubon" = 1 ]; then cmd_node_github "$node" on >/dev/null; fi
-      if [ "$hoston" = 1 ]; then cmd_node_host "$node" on >/dev/null; fi
+      recreate_node "$node" "$want"
       echo "dind: $action for $node (recreated; workspace, net, github, host preserved)" ;;
     *) die "usage: hive $node dind on|off|status" ;;
   esac
@@ -1042,10 +1059,11 @@ case $cmd in
                     setup_project_github "$cmd" "$PREFIX$cmd" ;;
         token)      docker container inspect "$PREFIX$cmd" >/dev/null 2>&1 || die "no such node: $cmd"
                     inject_read_token "$PREFIX$cmd" ;;
+        recreate)   cmd_node_recreate "$cmd" ;;
         sh)         cmd_sh          "$cmd" "$@" ;;
         claude)     cmd_claude      "$cmd" "$@" ;;
         status)     cmd_node_status "$cmd" ;;
-        *) die "unknown verb '$verb' for node '$cmd' (net|github|host|dind|repo|token|sh|claude|status)" ;;
+        *) die "unknown verb '$verb' for node '$cmd' (net|github|host|dind|repo|token|recreate|sh|claude|status)" ;;
       esac
     else
       echo "hive: unknown command or node: $cmd" >&2
