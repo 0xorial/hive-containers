@@ -205,53 +205,51 @@ EOMD
 # dir/repo. Every step is idempotent: git init only if absent, CLAUDE.md only if
 # absent, repo created only if missing, deploy key added only if not present.
 setup_project() {
-  local name=$1 c="$PREFIX$1"
-  note "setting up project '$name'…"
+  local name=$1 fresh=$2 c="$PREFIX$1"
+  inject_read_token "$c"   # container-level (read-all token); does NOT touch the repo
+  if [ "$fresh" != 1 ]; then
+    note "'$name' bound to an existing dir — its repo is left ENTIRELY untouched (no git init, no commit, no CLAUDE.md, no GitHub)."
+    return 0
+  fi
+  # only a brand-new empty dir gets scaffolded — and never committed/pushed.
+  note "scaffolding new project '$name' (local files only — no commit, no GitHub)…"
   if ! docker exec -u dev "$c" test -f /workspace/CLAUDE.md 2>/dev/null; then
     project_claudemd "$name" | docker exec -i -u dev "$c" sh -c 'cat > /workspace/CLAUDE.md'
   fi
-  docker exec -u dev "$c" bash -s "$name" <<'EOSH'
-set -e
-name=$1
-cd /workspace
-[ -d .git ] || git init -q
-git config user.name  "hive-$name" 2>/dev/null || true
-git config user.email "$name@hive.local" 2>/dev/null || true
-mkdir -p .hive
-[ -f .hive/history.md ] || printf '## Consolidated\n\n## Log\n' > .hive/history.md
-git add -A
-git diff --cached --quiet || git commit -q -m "hive: project scaffold"
-EOSH
-  setup_project_github "$name" "$c"
-  inject_read_token "$c"
+  docker exec -u dev "$c" bash -lc '
+    cd /workspace
+    [ -d .git ] || git init -q
+    mkdir -p .hive
+    [ -f .hive/history.md ] || printf "## Consolidated\n\n## Log\n" > .hive/history.md
+  '
+  echo "  scaffolded. When you want a remote: hive $name repo"
 }
 
-# Best-effort: private GitHub repo (matching name) + write deploy key generated
-# in the container. Needs gh authed (hive github login) and net on for SSH push.
-# Private repo + write deploy key. Adopts an existing origin if the repo already
-# has one (owner/name parsed from it); otherwise uses <owner>/<name> and creates
-# it. Best-effort: needs gh login + net on (SSH push). Never force-pushes.
+# EXPLICIT only (hive <node> repo). Creates a private GitHub repo + write deploy
+# key and pushes — but ONLY if the workspace has NO git remote AND no same-named
+# repo exists. It NEVER repoints an existing remote, never pushes over an
+# existing repo, never commits. Refuses otherwise.
 setup_project_github() {
   local name=$1 c="$PREFIX$1" owner repo url pub
-  owner=$(docker exec "${PREFIX}root" gh api user -q .login 2>/dev/null || true)
-  if [ -z "$owner" ]; then
-    note "GitHub skipped (no gh login). Run: hive github login, then: hive $name repo"
+  url=$(docker exec -u dev "$c" sh -c 'cd /workspace && git remote get-url origin 2>/dev/null' || true)
+  if [ -n "$url" ]; then
+    note "refusing: $name already has a git remote ($url). hive won't repoint or push to existing remotes."
     return 0
   fi
-  url=$(docker exec -u dev "$c" sh -c 'cd /workspace && git remote get-url origin 2>/dev/null' || true)
-  case "$url" in
-    *github.com[:/]*) repo=$(printf '%s' "$url" | sed -E 's#.*github\.com[:/]##; s#\.git$##') ;;
-    *) repo="$owner/$name" ;;
-  esac
+  owner=$(docker exec "${PREFIX}root" gh api user -q .login 2>/dev/null || true)
+  if [ -z "$owner" ]; then note "no gh login — run: hive github login"; return 0; fi
+  repo="$owner/$name"
   if docker exec "${PREFIX}root" gh repo view "$repo" >/dev/null 2>&1; then
-    echo "  using existing repo $repo"
-  else
-    docker exec "${PREFIX}root" gh repo create "$repo" --private >/dev/null 2>&1 \
-      && echo "  created private repo $repo" || { note "could not create/find repo $repo"; return 0; }
+    note "refusing: $repo already exists on GitHub. Won't push to it — set the remote yourself if that's intended."
+    return 0
   fi
+  if ! docker exec "${PREFIX}root" gh repo create "$repo" --private >/dev/null 2>&1; then
+    note "could not create repo $repo"; return 0
+  fi
+  echo "  created private repo $repo"
   docker exec -u dev "$c" bash -c 'test -f ~/.ssh/hive_deploy || { mkdir -p ~/.ssh && chmod 700 ~/.ssh && ssh-keygen -q -t ed25519 -N "" -C "$0-deploy" -f ~/.ssh/hive_deploy; }' "$name"
   pub=$(docker exec -u dev "$c" cat /home/dev/.ssh/hive_deploy.pub 2>/dev/null)
-  if [ -n "$pub" ] && ! docker exec "${PREFIX}root" gh api "repos/$repo/keys" -q '.[].title' 2>/dev/null | grep -qx "hive-$name"; then
+  if [ -n "$pub" ]; then
     docker exec "${PREFIX}root" gh api "repos/$repo/keys" -f "title=hive-$name" -F read_only=false -f "key=$pub" >/dev/null 2>&1 \
       && echo "  added write deploy key" || note "deploy key not added"
   fi
@@ -260,15 +258,9 @@ repo=$1
 grep -q '^Host github.com' ~/.ssh/config 2>/dev/null || printf 'Host github.com\n  IdentityFile ~/.ssh/hive_deploy\n  IdentitiesOnly yes\n  StrictHostKeyChecking accept-new\n' >> ~/.ssh/config
 chmod 600 ~/.ssh/config 2>/dev/null || true
 cd /workspace
-git remote remove origin 2>/dev/null || true
 git remote add origin "git@github.com:$repo.git"
 git branch -M main 2>/dev/null || true
-if [ -z "$(git ls-remote origin 2>/dev/null)" ]; then
-  git push -u origin main >/dev/null 2>&1 && echo "  pushed to git@github.com:$repo.git" || true
-else
-  git branch --set-upstream-to=origin/main main >/dev/null 2>&1 || true
-  echo "  origin set to git@github.com:$repo.git (existing history left intact)"
-fi
+git push -u origin main >/dev/null 2>&1 && echo "  pushed to git@github.com:$repo.git" || true
 EOSH
 }
 
@@ -331,7 +323,7 @@ cmd_new() {
   # --bind => project node, new OR existing dir: one flow, steps are idempotent
   # (git init only if needed, create-repo only if missing, CLAUDE.md only if
   # absent). Recreate (HIVE_RECREATE=1) reuses --bind but must NOT re-onboard.
-  local project=0
+  local project=0 fresh=0
   if [ -n "$bind" ]; then
     # accept ~, relative, and absolute; resolve to an absolute path
     case $bind in
@@ -340,6 +332,9 @@ cmd_new() {
       /*)    ;;
       *)     bind="$PWD/$bind" ;;
     esac
+    # fresh = brand-new empty dir (the only thing we'll scaffold). Existing dirs
+    # are left untouched.
+    if [ ! -e "$bind" ] || [ -z "$(ls -A "$bind" 2>/dev/null)" ]; then fresh=1; fi
     [ -e "$bind" ] || mkdir -p "$bind"
     [ "${HIVE_RECREATE:-}" = 1 ] || project=1
     args+=(-v "$bind:/workspace")
@@ -371,7 +366,7 @@ cmd_new() {
   # project node: internet on, then scaffold/adopt git + GitHub
   if [ "$project" = 1 ]; then
     cmd_node_net "$name" on >/dev/null 2>&1 || note "could not enable net for $name"
-    setup_project "$name"
+    setup_project "$name" "$fresh"
   fi
   echo "node '$name' up (parent: $parent)."
   if [ "$dind" = 1 ]; then echo "  (nested dockerd starting — 'docker ps' inside works in a few seconds)"; fi
