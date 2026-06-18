@@ -16,3 +16,6 @@ node_modules/
 .env
 .env.*
 *.tmp
+
+# hive runtime state (per-machine; the live "net on" source-IP set, not config)
+config/open-nodes
