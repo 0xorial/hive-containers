@@ -164,6 +164,94 @@ cmd_status() {
 
 # ---------------- nodes ----------------
 
+# The project CLAUDE.md written into a fresh bound project (committed to its repo).
+project_claudemd() {
+  local name=$1
+  cat <<EOMD
+# $name
+
+Conventions for any agent working in this project.
+
+## Responses
+Shortest possible. No preamble, no restating the task, no validation/agreement
+filler. Result first; expand only if asked.
+
+## Git
+- Commit often — small commits after each meaningful change.
+- \`origin\` is a private GitHub repo; this container holds a write **deploy key**,
+  so \`git push\` works (over SSH, needs net on).
+
+## Memory
+Maintain \`.hive/history.md\` (committed): a bounded \`## Consolidated\` summary +
+an append-only \`## Log\` of one-line entries. Append as you work; periodically
+fold the log into Consolidated (drop redundancy). Read it first in a new
+session — it's the project history, cheap on tokens.
+
+## Tools already installed (do NOT probe for these)
+git, gh, docker, node, npm, python3/pip, curl, wget, jq, ripgrep (rg), fd, bat,
+psql, mysql, redis-cli, sqlite3, build-essential/make/gcc, nmap, tcpdump, dig,
+nc, socat, rsync, htop, tmux, vim, nano. Base image: hive/node.
+
+## Docker
+You can build/run containers via the mounted host Docker socket. The engine is
+**shared** with other projects, so **namespace everything with \`$name-\`**:
+images \`$name-*\`, containers \`$name-*\`, networks/volumes \`$name-*\`.
+EOMD
+}
+
+# Fresh bound project: local git + project files + first commit (in-container).
+setup_new_project() {
+  local name=$1 c="$PREFIX$1"
+  note "scaffolding project '$name'…"
+  project_claudemd "$name" | docker exec -i -u dev "$c" sh -c 'cat > /workspace/CLAUDE.md'
+  docker exec -u dev "$c" bash -s "$name" <<'EOSH'
+set -e
+name=$1
+cd /workspace
+[ -d .git ] || git init -q
+git config user.name  "hive-$name" 2>/dev/null || true
+git config user.email "$name@hive.local" 2>/dev/null || true
+mkdir -p .hive
+[ -f .hive/history.md ] || printf '## Consolidated\n\n## Log\n' > .hive/history.md
+printf '.hive/\n' > .gitignore.hive 2>/dev/null || true   # keep history out of ignore by default
+rm -f .gitignore.hive
+git add -A
+git diff --cached --quiet || git commit -q -m "hive: initial project scaffold"
+EOSH
+  setup_project_github "$name" "$c"
+}
+
+# Best-effort: private GitHub repo (matching name) + write deploy key generated
+# in the container. Needs gh authed (hive github login) and net on for SSH push.
+setup_project_github() {
+  local name=$1 c="$PREFIX$1" owner pub
+  owner=$(docker exec "${PREFIX}root" gh api user -q .login 2>/dev/null || true)
+  if [ -z "$owner" ]; then
+    note "GitHub skipped (no gh login) — local repo is ready. Run: hive github login, then: hive $name repo"
+    return 0
+  fi
+  if ! docker exec "${PREFIX}root" gh repo view "$owner/$name" >/dev/null 2>&1; then
+    docker exec "${PREFIX}root" gh repo create "$owner/$name" --private >/dev/null 2>&1 \
+      && echo "  created private repo $owner/$name" || { note "could not create repo $owner/$name"; return 0; }
+  fi
+  docker exec -u dev "$c" bash -c 'test -f ~/.ssh/hive_deploy || { mkdir -p ~/.ssh && chmod 700 ~/.ssh && ssh-keygen -q -t ed25519 -N "" -C "$0-deploy" -f ~/.ssh/hive_deploy; }' "$name"
+  pub=$(docker exec -u dev "$c" cat /home/dev/.ssh/hive_deploy.pub 2>/dev/null)
+  if [ -n "$pub" ]; then
+    docker exec "${PREFIX}root" gh api "repos/$owner/$name/keys" -f "title=hive-$name" -F read_only=false -f "key=$pub" >/dev/null 2>&1 \
+      && echo "  added write deploy key" || note "deploy key not added (may already exist)"
+  fi
+  docker exec -u dev "$c" bash -s "$owner" "$name" <<'EOSH'
+owner=$1; name=$2
+printf 'Host github.com\n  IdentityFile ~/.ssh/hive_deploy\n  IdentitiesOnly yes\n  StrictHostKeyChecking accept-new\n' > ~/.ssh/config
+chmod 600 ~/.ssh/config
+cd /workspace
+git remote remove origin 2>/dev/null || true
+git remote add origin "git@github.com:$owner/$name.git"
+git branch -M main
+git push -u origin main >/dev/null 2>&1 && echo "  pushed to git@github.com:$owner/$name.git" || true
+EOSH
+}
+
 cmd_new() {
   if [ $# -lt 1 ]; then die "usage: hive new <name> [--parent p] [--bind dir] [--image img] [--uplink] [-- docker args]"; fi
   local name=$1; shift
@@ -220,14 +308,25 @@ cmd_new() {
   # VM-isolated runtime (e.g. kata) when configured and registered in the engine
   if [ -n "$NODE_RUNTIME" ]; then args+=(--runtime "$NODE_RUNTIME"); fi
 
+  local new_project=0
   if [ -n "$bind" ]; then
     case $bind in
       /*) ;;
       *) die "--bind needs an absolute Mac path" ;;
     esac
+    # empty / non-existent path => fresh project: scaffold + git + GitHub later
+    if [ ! -e "$bind" ] || [ -z "$(ls -A "$bind" 2>/dev/null)" ]; then
+      new_project=1
+      mkdir -p "$bind"
+    fi
     args+=(-v "$bind:/workspace")
   else
     args+=(-v "hive-ws-$name:/workspace")
+  fi
+
+  # a fresh bound project also gets host Docker access (it namespaces by its name)
+  if [ "$new_project" = 1 ]; then
+    args+=(-v /var/run/docker.sock:/var/run/docker.sock)
   fi
 
   if [ "$uplink" = 0 ]; then
@@ -246,6 +345,11 @@ cmd_new() {
   fi
   # --host is sugar: create, then turn the live host switch on
   if [ "$host" = 1 ]; then cmd_node_host "$name" on; fi
+  # fresh bound project: internet on, then scaffold git + GitHub
+  if [ "$new_project" = 1 ]; then
+    cmd_node_net "$name" on >/dev/null 2>&1 || note "could not enable net for $name"
+    setup_new_project "$name"
+  fi
   echo "node '$name' up (parent: $parent)."
   if [ "$dind" = 1 ]; then echo "  (nested dockerd starting — 'docker ps' inside works in a few seconds)"; fi
   echo "  hive sh $name            # shell"
@@ -828,10 +932,12 @@ case $cmd in
         github)     cmd_node_github "$cmd" "$@" ;;
         host)       cmd_node_host   "$cmd" "$@" ;;
         dind)       cmd_node_dind   "$cmd" "$@" ;;
+        repo)       docker container inspect "$PREFIX$cmd" >/dev/null 2>&1 || die "no such node: $cmd"
+                    setup_project_github "$cmd" "$PREFIX$cmd" ;;
         sh)         cmd_sh          "$cmd" "$@" ;;
         claude)     cmd_claude      "$cmd" "$@" ;;
         status)     cmd_node_status "$cmd" ;;
-        *) die "unknown verb '$verb' for node '$cmd' (net|github|host|dind|sh|claude|status)" ;;
+        *) die "unknown verb '$verb' for node '$cmd' (net|github|host|dind|repo|sh|claude|status)" ;;
       esac
     else
       echo "hive: unknown command or node: $cmd" >&2
