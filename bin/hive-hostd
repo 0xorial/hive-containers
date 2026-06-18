@@ -8,9 +8,11 @@ output. Every command is logged. Treat any host-enabled node as fully trusted:
 it can run anything on your Mac.
 
 No token in the request = refused. The token gates everything, so keep it
-secret and only `host on` the nodes you trust. Bind address is configurable
-(HIVE_HOSTD_BIND); it must be reachable from the bridge, so it can't be
-loopback — keep your macOS firewall on.
+secret and only `host on` the nodes you trust. By default the daemon binds
+loopback (127.0.0.1): the bridge reaches it over the host gateway, which lands
+on loopback, so the command port is never exposed on your LAN. Override the
+bind with HIVE_HOSTD_BIND only if your gateway requires it — and if you do,
+keep your macOS firewall on.
 """
 import hmac, json, os, pathlib, subprocess, sys, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer

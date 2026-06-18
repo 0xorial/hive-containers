@@ -39,7 +39,14 @@ if [ "$(id -u)" -eq 0 ]; then
   # nor pollutes the bind-mounted /workspace). Rendered every start, so it stays
   # correct across restarts and recreation.
   hive_name="${HIVE_NAME:-$(hostname)}"
-  if [ -S /var/run/docker.sock ]; then hive_role=root; else hive_role=node; fi
+  # root == this container can actually drive Docker: the socket must be present
+  # AND a usable docker client installed (the hive/root image adds the client).
+  # A bare socket on a plain node image is not a working control plane.
+  if [ -S /var/run/docker.sock ] && command -v docker >/dev/null 2>&1; then
+    hive_role=root
+  else
+    hive_role=node
+  fi
   mkdir -p /etc/claude-code
 
   if [ -n "${HTTP_PROXY:-}" ]; then
