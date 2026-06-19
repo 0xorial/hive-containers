@@ -121,7 +121,25 @@ cmd_up() {
     note "first run: building images (this takes a few minutes)"
     cmd_build
   fi
+  # Legacy migration: an older hive created hive-net as `internal` (no internet).
+  # Compose won't flip an existing network's flags, so recreate it here:
+  # disconnect attached containers, drop it, let compose remake it non-internal,
+  # then reconnect the nodes (root is reconnected by compose).
+  local reconnect="" _n
+  if docker network inspect "$NET" >/dev/null 2>&1 \
+     && [ "$(docker network inspect "$NET" -f '{{.Internal}}' 2>/dev/null)" = true ]; then
+    note "$NET is a legacy 'internal' network (no internet) — recreating it…"
+    reconnect=$(docker network inspect "$NET" -f '{{range .Containers}}{{.Name}} {{end}}' 2>/dev/null)
+    # shellcheck disable=SC2086
+    for _n in $reconnect; do docker network disconnect -f "$NET" "$_n" 2>/dev/null || true; done
+    docker network rm "$NET" >/dev/null 2>&1 || note "couldn't remove $NET (still in use) — try: hive down && hive up"
+  fi
   compose up -d --build
+  # shellcheck disable=SC2086
+  for _n in $reconnect; do
+    [ "$_n" = "${PREFIX}root" ] && continue
+    docker network connect "$NET" "$_n" 2>/dev/null || true
+  done
   # recreating root loses its injected ssh key (container fs); restore it
   if [ -f "$HOME/.ssh/hive_ed25519.pub" ]; then
     inject_ssh_key "${PREFIX}root" 2>/dev/null || true
@@ -848,6 +866,12 @@ cmd_doctor() {
   check "root container running"         docker exec "${PREFIX}root" true
   check "root can drive docker (socket)" docker exec "${PREFIX}root" docker ps
   check "root has internet"              docker exec "${PREFIX}root" curl -sS -o /dev/null -m 20 https://api.anthropic.com
+  if [ "$(docker network inspect "$NET" -f '{{.Internal}}' 2>/dev/null)" = true ]; then
+    echo "  FAIL $NET is 'internal' — nodes have no internet; run 'hive up' to recreate it"
+    DOCTOR_FAIL=1
+  else
+    echo "  ok   $NET is not internal (nodes get internet)"
+  fi
   if [ "$DOCTOR_FAIL" != 0 ]; then
     exit 1
   fi
