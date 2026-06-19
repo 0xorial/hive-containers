@@ -69,6 +69,8 @@ nodes
        --bind <abs-path>           bind-mount a Mac dir as /workspace
                                    (default: named volume hive-ws-<name>)
        --image <img>               alternate image (default: hive/node)
+       --dind                      nested docker engine (privileged; uses hive/dev)
+       --docker                    mount the host Docker socket (use the host engine; uses hive/dev)
   hive ls                          list containers + guests on hive-net
   hive tree                        show the hierarchy
   hive sh [name] [cmd...]          shell into a node (default: root)
@@ -80,7 +82,8 @@ per-node switches (live — applied to the running container, no recreate)
   hive <node> github on|off|status     give/remove your github token for one node
   hive <node> host on|off|status       let this node run commands on your Mac
   hive <node> dind on|off|status       nested docker engine (recreates the node)
-  hive <node> status                   show github + host + dind state
+  hive <node> docker on|off|status     mount the host Docker socket instead (recreates; turns dind off)
+  hive <node> status                   show github + host + dind + docker state
   hive <node> sh|claude [...]          same as 'hive sh <node>' / 'hive claude <node>'
 
 run commands on the Mac from a node (deliberate, opt-in hole)
@@ -272,13 +275,13 @@ EOSH
 }
 
 cmd_new() {
-  if [ $# -lt 1 ]; then die "usage: hive new <name> [--parent p] [--bind dir] [--image img] [-- docker args]"; fi
+  if [ $# -lt 1 ]; then die "usage: hive new <name> [--parent p] [--bind dir] [--image img] [--dind|--docker] [-- docker args]"; fi
   local name=$1; shift
   if ! [[ "$name" =~ ^[a-z0-9][a-z0-9_-]*$ ]]; then
     die "name must be lowercase alphanumeric plus '-' or '_'"
   fi
 
-  local parent=root bind="" image=$NODE_IMAGE host=0 dind=0 image_set=0
+  local parent=root bind="" image=$NODE_IMAGE host=0 dind=0 dockmount=0 image_set=0
   local extra=()
   while [ $# -gt 0 ]; do
     case $1 in
@@ -287,14 +290,20 @@ cmd_new() {
       --image)  image=$2; image_set=1; shift 2 ;;
       --host)   host=1;    shift ;;
       --dind)   dind=1;    shift ;;
+      --docker) dockmount=1; shift ;;
       --) shift; extra=("$@"); break ;;
       *) die "unknown option '$1' (use -- to pass raw docker run args)" ;;
     esac
   done
-  if [ "$dind" = 1 ]; then
+  if [ "$dind" = 1 ] && [ "$dockmount" = 1 ]; then
+    die "--dind and --docker are mutually exclusive (both bind /var/run/docker.sock)"
+  fi
+  # dind needs the engine; --docker needs the client. Both ship in the dev image,
+  # so default to it unless an explicit --image was given.
+  if [ "$dind" = 1 ] || [ "$dockmount" = 1 ]; then
     [ "$image_set" = 0 ] && image=$DEV_IMAGE
     if ! docker image inspect "$image" >/dev/null 2>&1; then
-      note "building $image (first --dind use; installs a docker engine)…"
+      note "building $image (provides the docker client/engine)…"
       docker build -f "$HIVE_HOME/images/dev/Dockerfile" -t "$DEV_IMAGE" "$HIVE_HOME" >/dev/null
     fi
   fi
@@ -343,8 +352,9 @@ cmd_new() {
     args+=(-v "hive-ws-$name:/workspace")
   fi
 
-  # project nodes get host Docker access (they namespace by their own name)
-  if [ "$project" = 1 ]; then
+  # host Docker access: project nodes (--bind) get it automatically; --docker
+  # requests it explicitly so the node drives the host engine, not a nested one.
+  if [ "$project" = 1 ] || [ "$dockmount" = 1 ]; then
     args+=(-v /var/run/docker.sock:/var/run/docker.sock)
   fi
 
@@ -472,27 +482,33 @@ cmd_node_host() {
   esac
 }
 
-# dind needs --privileged, a creation-time capability — so toggling it on a
-# running node transparently recreates it, preserving the workspace and the
-# github/host state (the container fs is rebuilt from the image).
-# Recreate a node from the current image, preserving workspace (bind/volume),
-# parent, and github/host state. Volumes reattach; container fs is fresh.
-# $1=node, $2=desired dind (0/1). HIVE_RECREATE stops cmd_new re-onboarding.
+# dind / host-docker are creation-time mounts, so toggling either transparently
+# recreates the node, preserving workspace, parent, image, and github/host state
+# (the container fs is rebuilt from the image).
+# $1=node  $2=want_dind  $3=want_dock   ('' = keep current). dind and the host
+# socket are mutually exclusive — both bind /var/run/docker.sock, so dind wins.
+# HIVE_RECREATE stops cmd_new re-onboarding.
 recreate_node() {
-  local node=$1 want_dind=$2 c="$PREFIX$1" parent bind image githubon=0 hoston=0
+  local node=$1 want_dind=${2:-} want_dock=${3:-} c="$PREFIX$1" parent bind image githubon=0 hoston=0 cur_dind=0 cur_dock=0
   parent=$(docker inspect -f '{{index .Config.Labels "hive.parent"}}' "$c")
   bind=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/workspace"}}{{if eq .Type "bind"}}{{.Source}}{{end}}{{end}}{{end}}' "$c")
   image=$(docker inspect -f '{{.Config.Image}}' "$c")
+  if docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$c" | grep -qx 'HIVE_DIND=1'; then cur_dind=1; fi
+  if docker inspect -f '{{range .Mounts}}{{if eq .Destination "/var/run/docker.sock"}}1{{end}}{{end}}' "$c" | grep -q 1; then cur_dock=1; fi
+  [ -z "$want_dind" ] && want_dind=$cur_dind
+  [ -z "$want_dock" ] && want_dock=$cur_dock
+  [ "$want_dind" = 1 ] && want_dock=0   # dind owns /var/run/docker.sock
   if docker exec -u dev "$c" test -f /home/dev/.git-credentials 2>/dev/null; then githubon=1; fi
   if docker exec -u dev "$c" test -f /home/dev/.config/hive/hostd-token 2>/dev/null; then hoston=1; fi
   docker rm -f "$c" >/dev/null
   local nargs=(--parent "$parent")
   if [ -n "$bind" ]; then nargs+=(--bind "$bind"); fi
-  # preserve a custom image; the default node/dev images are left to track --dind
+  # preserve a custom image; the default node/dev images track --dind/--docker
   if [ -n "$image" ] && [ "$image" != "$NODE_IMAGE" ] && [ "$image" != "$DEV_IMAGE" ]; then
     nargs+=(--image "$image")
   fi
   if [ "$want_dind" = 1 ]; then nargs+=(--dind); fi
+  if [ "$want_dock" = 1 ]; then nargs+=(--docker); fi
   # NOTE: raw `-- <docker run args>` from the original `hive new` are not replayed
   # here (they can't be recovered from `docker inspect`).
   HIVE_RECREATE=1; cmd_new "$node" "${nargs[@]}" >/dev/null; unset HIVE_RECREATE
@@ -501,11 +517,10 @@ recreate_node() {
 }
 
 cmd_node_recreate() {
-  local node=$1 c="$PREFIX$1" d=0
+  local node=$1 c="$PREFIX$1"
   docker container inspect "$c" >/dev/null 2>&1 || die "no such node: $node"
-  if docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$c" | grep -qx 'HIVE_DIND=1'; then d=1; fi
-  note "recreating $node from the current image (workspace + volumes + github/host preserved)…"
-  recreate_node "$node" "$d"
+  note "recreating $node from the current image (workspace + volumes + dind/docker/github/host preserved)…"
+  recreate_node "$node"
   echo "recreated $node"
 }
 
@@ -526,6 +541,29 @@ cmd_node_dind() {
   esac
 }
 
+# docker on/off mounts (or removes) the host Docker socket so the node drives the
+# host's engine instead of a nested one. Creation-time, so it recreates the node;
+# turning it on turns dind off (they can't share /var/run/docker.sock).
+cmd_node_docker() {
+  local node=$1 action=${2:-status} c="$PREFIX$1"
+  docker container inspect "$c" >/dev/null 2>&1 || die "no such node: $node"
+  case $action in
+    status)
+      if docker inspect -f '{{range .Mounts}}{{if eq .Destination "/var/run/docker.sock"}}1{{end}}{{end}}' "$c" | grep -q 1; then
+        echo "docker: ON  ($node mounts the host Docker socket)"
+      else echo "docker: OFF ($node)"; fi ;;
+    on)
+      note "recreating $node with the host Docker socket (dind off; workspace + state preserved)…"
+      recreate_node "$node" 0 1
+      echo "docker: ON for $node (recreated; uses the host engine)" ;;
+    off)
+      note "recreating $node without the host Docker socket (workspace + state preserved)…"
+      recreate_node "$node" "" 0
+      echo "docker: OFF for $node (recreated)" ;;
+    *) die "usage: hive $node docker on|off|status" ;;
+  esac
+}
+
 cmd_node_status() {
   local node=$1 c="$PREFIX$1"
   docker container inspect "$c" >/dev/null 2>&1 || die "no such node: $node"
@@ -533,6 +571,7 @@ cmd_node_status() {
   cmd_node_github "$node" status
   cmd_node_host "$node" status
   cmd_node_dind "$node" status
+  cmd_node_docker "$node" status
 }
 
 # ---------------- host daemon (Mac side) ----------------
@@ -925,6 +964,7 @@ case $cmd in
         github)     cmd_node_github "$cmd" "$@" ;;
         host)       cmd_node_host   "$cmd" "$@" ;;
         dind)       cmd_node_dind   "$cmd" "$@" ;;
+        docker)     cmd_node_docker "$cmd" "$@" ;;
         repo)       docker container inspect "$PREFIX$cmd" >/dev/null 2>&1 || die "no such node: $cmd"
                     setup_project_github "$cmd" "$PREFIX$cmd" ;;
         token)      docker container inspect "$PREFIX$cmd" >/dev/null 2>&1 || die "no such node: $cmd"
@@ -933,7 +973,7 @@ case $cmd in
         sh)         cmd_sh          "$cmd" "$@" ;;
         claude)     cmd_claude      "$cmd" "$@" ;;
         status)     cmd_node_status "$cmd" ;;
-        *) die "unknown verb '$verb' for node '$cmd' (github|host|dind|repo|token|recreate|sh|claude|status)" ;;
+        *) die "unknown verb '$verb' for node '$cmd' (github|host|dind|docker|repo|token|recreate|sh|claude|status)" ;;
       esac
     else
       echo "hive: unknown command or node: $cmd" >&2
