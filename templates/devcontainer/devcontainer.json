@@ -17,14 +17,5 @@
 	"mounts": [
 		"source=hive-shared,target=/shared,type=volume",
 		"source=hive-claude,target=/home/dev/.claude,type=volume"
-	],
-	"containerEnv": {
-		"HIVE_PROXY": "http://bridge:3128",
-		"HTTP_PROXY": "http://bridge:3128",
-		"HTTPS_PROXY": "http://bridge:3128",
-		"http_proxy": "http://bridge:3128",
-		"https_proxy": "http://bridge:3128",
-		"NO_PROXY": "localhost,127.0.0.1,bridge",
-		"no_proxy": "localhost,127.0.0.1,bridge"
-	}
+	]
 }
