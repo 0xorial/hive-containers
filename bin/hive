@@ -218,7 +218,7 @@ setup_project() {
   local name=$1 fresh=$2 c="$PREFIX$1"
   inject_read_token "$c"   # container-level (read-all token); does NOT touch the repo
   if [ "$fresh" != 1 ]; then
-    note "'$name' bound to an existing dir — its repo is left ENTIRELY untouched (no git init, no commit, no CLAUDE.md, no GitHub)."
+    note "'$name' bound to an existing dir — repo files untouched. (run \`hive $name github on\` to grant write access.)"
     return 0
   fi
   # only a brand-new empty dir gets scaffolded — and never committed/pushed.
@@ -232,46 +232,100 @@ setup_project() {
     mkdir -p .hive
     [ -f .hive/history.md ] || printf "## Consolidated\n\n## Log\n" > .hive/history.md
   '
-  echo "  scaffolded. When you want a remote: hive $name repo"
+  echo "  scaffolded. \`hive $name github on\` to create the GitHub repo and grant write access."
 }
 
-# EXPLICIT only (hive <node> repo). Creates a private GitHub repo + write deploy
-# key and pushes — but ONLY if the workspace has NO git remote AND no same-named
-# repo exists. It NEVER repoints an existing remote, never pushes over an
-# existing repo, never commits. Refuses otherwise.
-setup_project_github() {
-  local name=$1 c="$PREFIX$1" owner repo url pub
+# Ensure $name has write access to its repo via a per-node ed25519 deploy key.
+#   - origin missing      → create $owner/$name on GitHub, set origin (ssh), push
+#   - origin = github     → upload deploy key (idempotent); repoint https→ssh
+#   - origin ≠ github     → skip with a note
+# Best-effort: never errors out; reports GitHub's actual response on failure.
+grant_write_access() {
+  local name=$1 c=$2 url owner_repo pub err who fresh_remote=0
   url=$(docker exec -u dev "$c" sh -c 'cd /workspace && git remote get-url origin 2>/dev/null' || true)
-  if [ -n "$url" ]; then
-    note "refusing: $name already has a git remote ($url). hive won't repoint or push to existing remotes."
-    return 0
+  if [ -z "$url" ]; then
+    local owner
+    owner=$(docker exec -u dev "$c" gh api user --jq .login 2>/dev/null || true)
+    if [ -z "$owner" ]; then
+      note "no 'origin' in $name and gh not logged in — \`hive github login\` first, then re-run \`hive $name github on\`."
+      return 0
+    fi
+    owner_repo="$owner/$name"
+    if docker exec -u dev "$c" gh repo view "$owner_repo" >/dev/null 2>&1; then
+      echo "  $owner_repo already exists on GitHub — wiring as origin (no push)"
+    else
+      if ! docker exec -u dev "$c" gh repo create "$owner_repo" --private >/dev/null 2>&1; then
+        note "could not create $owner_repo on GitHub"; return 0
+      fi
+      echo "  created private repo $owner_repo"
+    fi
+    url="git@github.com:$owner_repo.git"
+    fresh_remote=1
+  else
+    case "$url" in
+      git@github.com:*)        owner_repo=${url#git@github.com:};        owner_repo=${owner_repo%.git} ;;
+      https://github.com/*)    owner_repo=${url#https://github.com/};    owner_repo=${owner_repo%.git} ;;
+      ssh://git@github.com/*)  owner_repo=${url#ssh://git@github.com/};  owner_repo=${owner_repo%.git} ;;
+      *) note "origin is $url (not github.com) — skipping deploy key"; return 0 ;;
+    esac
   fi
-  owner=$(docker exec "${PREFIX}root" gh api user -q .login 2>/dev/null || true)
-  if [ -z "$owner" ]; then note "no gh login — run: hive github login"; return 0; fi
-  repo="$owner/$name"
-  if docker exec "${PREFIX}root" gh repo view "$repo" >/dev/null 2>&1; then
-    note "refusing: $repo already exists on GitHub. Won't push to it — set the remote yourself if that's intended."
-    return 0
-  fi
-  if ! docker exec "${PREFIX}root" gh repo create "$repo" --private >/dev/null 2>&1; then
-    note "could not create repo $repo"; return 0
-  fi
-  echo "  created private repo $repo"
   docker exec -u dev "$c" bash -c 'test -f ~/.ssh/hive_deploy || { mkdir -p ~/.ssh && chmod 700 ~/.ssh && ssh-keygen -q -t ed25519 -N "" -C "$0-deploy" -f ~/.ssh/hive_deploy; }' "$name"
   pub=$(docker exec -u dev "$c" cat /home/dev/.ssh/hive_deploy.pub 2>/dev/null)
-  if [ -n "$pub" ]; then
-    docker exec "${PREFIX}root" gh api "repos/$repo/keys" -f "title=hive-$name" -F read_only=false -f "key=$pub" >/dev/null 2>&1 \
-      && echo "  added write deploy key" || note "deploy key not added"
+  if [ -z "$pub" ]; then note "could not generate deploy key in $name"; return 0; fi
+  if docker exec -u dev "$c" gh api "repos/$owner_repo/keys" --jq ".[] | select(.title==\"hive-$name\") | .id" 2>/dev/null | grep -q .; then
+    echo "  deploy key hive-$name already present on $owner_repo"
+  else
+    err=$(docker exec -u dev "$c" gh api "repos/$owner_repo/keys" -f "title=hive-$name" -F read_only=false -f "key=$pub" 2>&1 >/dev/null)
+    if [ $? -eq 0 ] && [ -z "$err" ]; then
+      echo "  added write deploy key to $owner_repo"
+    else
+      who=$(docker exec -u dev "$c" gh api user --jq .login 2>/dev/null || echo "<not logged in>")
+      note "deploy key NOT added to $owner_repo. gh is authed as: $who"
+      printf '  github said: %s\n' "$err" >&2
+      [ "$who" != "${owner_repo%%/*}" ] && note "(authed as '$who' but repo owner is '${owner_repo%%/*}' — \`hive github login\` to switch accounts if you need admin)"
+      return 0
+    fi
   fi
-  docker exec -u dev "$c" bash -s "$repo" <<'EOSH'
-repo=$1
+  docker exec -u dev "$c" bash -s "$owner_repo" "$url" "$fresh_remote" <<'EOSH'
+repo=$1; url=$2; fresh=$3
 grep -q '^Host github.com' ~/.ssh/config 2>/dev/null || printf 'Host github.com\n  IdentityFile ~/.ssh/hive_deploy\n  IdentitiesOnly yes\n  StrictHostKeyChecking accept-new\n' >> ~/.ssh/config
 chmod 600 ~/.ssh/config 2>/dev/null || true
 cd /workspace
-git remote add origin "git@github.com:$repo.git"
-git branch -M main 2>/dev/null || true
-git push -u origin main >/dev/null 2>&1 && echo "  pushed to git@github.com:$repo.git" || true
+if [ "$fresh" = "1" ]; then
+  git remote add origin "git@github.com:$repo.git" 2>/dev/null && echo "  set origin to git@github.com:$repo.git"
+  git branch -M main 2>/dev/null || true
+  if [ -d .git ] && git rev-parse --verify HEAD >/dev/null 2>&1; then
+    git push -u origin main >/dev/null 2>&1 && echo "  pushed main"
+  fi
+else
+  case "$url" in
+    https://github.com/*|ssh://git@github.com/*)
+      git remote set-url origin "git@github.com:$repo.git" && echo "  repointed origin to git@github.com:$repo.git" ;;
+  esac
+fi
 EOSH
+}
+
+# Inverse of grant_write_access: remove the hive-$name deploy key from the
+# github.com origin (if any) and delete the local keypair. Best-effort.
+revoke_write_access() {
+  local name=$1 c=$2 url owner_repo key_id
+  url=$(docker exec -u dev "$c" sh -c 'cd /workspace && git remote get-url origin 2>/dev/null' || true)
+  case "$url" in
+    git@github.com:*)        owner_repo=${url#git@github.com:};        owner_repo=${owner_repo%.git} ;;
+    https://github.com/*)    owner_repo=${url#https://github.com/};    owner_repo=${owner_repo%.git} ;;
+    ssh://git@github.com/*)  owner_repo=${url#ssh://git@github.com/};  owner_repo=${owner_repo%.git} ;;
+    *) owner_repo="" ;;
+  esac
+  if [ -n "$owner_repo" ]; then
+    key_id=$(docker exec -u dev "$c" gh api "repos/$owner_repo/keys" --jq ".[] | select(.title==\"hive-$name\") | .id" 2>/dev/null | head -n1)
+    if [ -n "$key_id" ]; then
+      docker exec -u dev "$c" gh api -X DELETE "repos/$owner_repo/keys/$key_id" >/dev/null 2>&1 \
+        && echo "  removed write deploy key from $owner_repo" \
+        || note "could not remove deploy key from $owner_repo"
+    fi
+  fi
+  docker exec -u dev "$c" bash -c 'rm -f ~/.ssh/hive_deploy ~/.ssh/hive_deploy.pub' 2>/dev/null || true
 }
 
 cmd_new() {
@@ -446,8 +500,10 @@ cmd_node_github() {
   case $action in
     on)
       ensure_github_token
-      if inject_github "$c"; then echo "github: ON for $node"; fi ;;
+      if inject_github "$c"; then echo "github: ON for $node"; fi
+      grant_write_access "$node" "$c" || true ;;
     off)
+      revoke_write_access "$node" "$c" || true
       docker exec -u dev "$c" bash -c 'rm -f ~/.git-credentials; git config --global --unset credential.helper 2>/dev/null; gh auth logout >/dev/null 2>&1; true'
       echo "github: OFF for $node (credentials removed)" ;;
     status)
@@ -468,11 +524,22 @@ cmd_node_host() {
     on)
       [ -f "$HOSTD_TOKEN_FILE" ] || die "no host daemon yet — run: hive hostd start"
       docker exec -i -u dev "$c" sh -c 'mkdir -p ~/.config/hive && umask 077 && cat > ~/.config/hive/hostd-token' < "$HOSTD_TOKEN_FILE"
-      echo "host: ON for $node — it can now run Mac commands with: host <cmd>"
+      local bind
+      bind=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/workspace"}}{{if eq .Type "bind"}}{{.Source}}{{end}}{{end}}{{end}}' "$c")
+      if [ -n "$bind" ]; then
+        printf '%s\n' "$bind" | docker exec -i -u dev "$c" sh -c 'umask 077 && cat > ~/.config/hive/host-workspace'
+        echo "host: ON for $node — it can ask to run Mac commands with: host <cmd>"
+        echo "      /workspace on the Mac: $bind  (also in ~/.config/hive/host-workspace)"
+      else
+        docker exec -u dev "$c" rm -f /home/dev/.config/hive/host-workspace 2>/dev/null || true
+        echo "host: ON for $node — it can ask to run Mac commands with: host <cmd>"
+        note "workspace is a named docker volume (not a bind) — no Mac-side path to record."
+      fi
+      echo "      each command waits for your y/N approval in the \`hive hostd\` console."
       curl -fsS -m 3 "http://127.0.0.1:$HOSTD_MAC_PORT/health" >/dev/null 2>&1 \
-        || note "the Mac daemon isn't up yet — run: hive hostd start" ;;
+        || note "the approval console isn't up yet — run: hive hostd start" ;;
     off)
-      docker exec -u dev "$c" rm -f /home/dev/.config/hive/hostd-token 2>/dev/null || true
+      docker exec -u dev "$c" rm -f /home/dev/.config/hive/hostd-token /home/dev/.config/hive/host-workspace 2>/dev/null || true
       echo "host: OFF for $node (token removed)" ;;
     status)
       if docker exec -u dev "$c" test -f /home/dev/.config/hive/hostd-token 2>/dev/null; then
@@ -587,19 +654,15 @@ cmd_hostd() {
         ( umask 077; openssl rand -hex 32 > "$HOSTD_TOKEN_FILE" ); echo "generated host token ($HOSTD_TOKEN_FILE)"
       fi
       if curl -fsS -m 3 "http://127.0.0.1:$HOSTD_MAC_PORT/health" >/dev/null 2>&1; then
-        echo "hostd already running on Mac:$HOSTD_MAC_PORT"
-      else
-        HIVE_HOSTD_PORT=$HOSTD_MAC_PORT nohup python3 "$daemon" >>"$logf" 2>&1 &
-        echo $! > "$pidf"; sleep 1
-        if ! curl -fsS -m 3 "http://127.0.0.1:$HOSTD_MAC_PORT/health" >/dev/null 2>&1; then
-          note "hostd failed to bind Mac:$HOSTD_MAC_PORT (in use?). Set a free port: HIVE_HOSTD_MAC_PORT=NNNN hive hostd start"
-          tail -n 3 "$logf" 2>/dev/null | sed 's/^/  /'
-          return 1
-        fi
-        echo "hostd running on Mac:$HOSTD_MAC_PORT (pid $(cat "$pidf")) — logs: hive hostd logs"
+        die "hostd already running on Mac:$HOSTD_MAC_PORT (another terminal?) — stop it with: hive hostd stop"
       fi
-      echo "nodes reach it directly at host.docker.internal:$HOSTD_MAC_PORT"
-      echo "now bless nodes:  hive <node> host on"
+      echo "bless nodes from another terminal:  hive <node> host on"
+      echo "nodes reach this daemon at host.docker.internal:$HOSTD_MAC_PORT"
+      echo "starting the approval console in the foreground — keep this window open, Ctrl-C to stop."
+      echo
+      # Foreground + interactive: this terminal IS the approval console. Each
+      # command a blessed node asks to run waits here for your y/N.
+      exec env HIVE_HOSTD_PORT="$HOSTD_MAC_PORT" python3 "$daemon"
       ;;
     stop)
       if [ -f "$pidf" ]; then kill "$(cat "$pidf")" 2>/dev/null || true; rm -f "$pidf"; fi
@@ -965,15 +1028,13 @@ case $cmd in
         host)       cmd_node_host   "$cmd" "$@" ;;
         dind)       cmd_node_dind   "$cmd" "$@" ;;
         docker)     cmd_node_docker "$cmd" "$@" ;;
-        repo)       docker container inspect "$PREFIX$cmd" >/dev/null 2>&1 || die "no such node: $cmd"
-                    setup_project_github "$cmd" "$PREFIX$cmd" ;;
         token)      docker container inspect "$PREFIX$cmd" >/dev/null 2>&1 || die "no such node: $cmd"
                     inject_read_token "$PREFIX$cmd" ;;
         recreate)   cmd_node_recreate "$cmd" ;;
         sh)         cmd_sh          "$cmd" "$@" ;;
         claude)     cmd_claude      "$cmd" "$@" ;;
         status)     cmd_node_status "$cmd" ;;
-        *) die "unknown verb '$verb' for node '$cmd' (github|host|dind|docker|repo|token|recreate|sh|claude|status)" ;;
+        *) die "unknown verb '$verb' for node '$cmd' (github|host|dind|docker|token|recreate|sh|claude|status)" ;;
       esac
     else
       echo "hive: unknown command or node: $cmd" >&2
