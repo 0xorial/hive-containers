@@ -218,7 +218,7 @@ setup_project() {
   local name=$1 fresh=$2 c="$PREFIX$1"
   inject_read_token "$c"   # container-level (read-all token); does NOT touch the repo
   if [ "$fresh" != 1 ]; then
-    note "'$name' bound to an existing dir — repo files untouched. (run \`hive $name github on\` to grant write access.)"
+    note "'$name' has an existing workspace — repo files untouched. (run \`hive $name github on\` to grant write access.)"
     return 0
   fi
   # only a brand-new empty dir gets scaffolded — and never committed/pushed.
@@ -286,12 +286,15 @@ grant_write_access() {
       return 0
     fi
   fi
-  docker exec -u dev "$c" bash -s "$owner_repo" "$url" "$fresh_remote" <<'EOSH'
+  # -i is load-bearing: without it docker exec closes stdin and bash -s reads
+  # an empty script, silently skipping the ssh config + origin wiring below.
+  docker exec -i -u dev "$c" bash -s "$owner_repo" "$url" "$fresh_remote" <<'EOSH'
 repo=$1; url=$2; fresh=$3
 grep -q '^Host github.com' ~/.ssh/config 2>/dev/null || printf 'Host github.com\n  IdentityFile ~/.ssh/hive_deploy\n  IdentitiesOnly yes\n  StrictHostKeyChecking accept-new\n' >> ~/.ssh/config
 chmod 600 ~/.ssh/config 2>/dev/null || true
 cd /workspace
 if [ "$fresh" = "1" ]; then
+  [ -d .git ] || git init -q
   git remote add origin "git@github.com:$repo.git" 2>/dev/null && echo "  set origin to git@github.com:$repo.git"
   git branch -M main 2>/dev/null || true
   if [ -d .git ] && git rev-parse --verify HEAD >/dev/null 2>&1; then
@@ -403,6 +406,11 @@ cmd_new() {
     [ "${HIVE_RECREATE:-}" = 1 ] || project=1
     args+=(-v "$bind:/workspace")
   else
+    # volume-backed nodes are projects too: a brand-new hive-ws volume gets the
+    # same scaffold as a fresh --bind dir, so `github on` has a repo to wire.
+    # An existing volume (rm without --purge, then new) is adopted untouched.
+    docker volume inspect "hive-ws-$name" >/dev/null 2>&1 || fresh=1
+    [ "${HIVE_RECREATE:-}" = 1 ] || project=1
     args+=(-v "hive-ws-$name:/workspace")
   fi
 
