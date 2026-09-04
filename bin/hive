@@ -38,6 +38,14 @@ if [ -z "$NODE_RUNTIME" ] && [ -f "$HIVE_HOME/config/runtime" ]; then
   NODE_RUNTIME="$(head -1 "$HIVE_HOME/config/runtime" | tr -d '[:space:]')"
 fi
 
+# Default bind root: when config/bind-root (or HIVE_BIND_ROOT) holds a Mac dir,
+# `hive new <name>` binds <root>/<name> instead of a hidden named volume, so
+# every node's workspace is visible on the host. --no-bind opts out per node.
+BIND_ROOT="${HIVE_BIND_ROOT:-}"
+if [ -z "$BIND_ROOT" ] && [ -f "$HIVE_HOME/config/bind-root" ]; then
+  BIND_ROOT="$(head -1 "$HIVE_HOME/config/bind-root" | tr -d '[:space:]')"
+fi
+
 die()  { echo "hive: $*" >&2; exit 1; }
 note() { echo "hive: $*" >&2; }
 
@@ -67,7 +75,9 @@ nodes
   hive new <name> [opts] [-- docker-run-args]
        --parent <node>             logical parent (default: root)
        --bind <abs-path>           bind-mount a Mac dir as /workspace
-                                   (default: named volume hive-ws-<name>)
+                                   (default: <config/bind-root>/<name> when set,
+                                    else named volume hive-ws-<name>)
+       --no-bind                   force a volume workspace despite bind-root
        --image <img>               alternate image (default: hive/node)
        --dind                      nested docker engine (privileged; uses hive/dev)
        --docker                    mount the host Docker socket (use the host engine; uses hive/dev)
@@ -338,12 +348,13 @@ cmd_new() {
     die "name must be lowercase alphanumeric plus '-' or '_'"
   fi
 
-  local parent=root bind="" image=$NODE_IMAGE host=0 dind=0 dockmount=0 image_set=0
+  local parent=root bind="" image=$NODE_IMAGE host=0 dind=0 dockmount=0 image_set=0 nobind=0
   local extra=()
   while [ $# -gt 0 ]; do
     case $1 in
       --parent) parent=$2; shift 2 ;;
       --bind)   bind=$2;   shift 2 ;;
+      --no-bind) nobind=1; shift ;;
       --image)  image=$2; image_set=1; shift 2 ;;
       --host)   host=1;    shift ;;
       --dind)   dind=1;    shift ;;
@@ -352,6 +363,13 @@ cmd_new() {
       *) die "unknown option '$1' (use -- to pass raw docker run args)" ;;
     esac
   done
+  # bind-root default: unbound nodes get <root>/<name> unless --no-bind asked
+  # for a volume. Recreates skip this — they replay the node's real mounts, so
+  # an old volume node must not silently become bound (or vice versa).
+  if [ -z "$bind" ] && [ "$nobind" != 1 ] && [ -n "$BIND_ROOT" ] && [ "${HIVE_RECREATE:-}" != 1 ]; then
+    bind="$BIND_ROOT/$name"
+    note "binding /workspace to $bind (config/bind-root; --no-bind for a volume)"
+  fi
   if [ "$dind" = 1 ] && [ "$dockmount" = 1 ]; then
     die "--dind and --docker are mutually exclusive (both bind /var/run/docker.sock)"
   fi
@@ -421,6 +439,10 @@ cmd_new() {
   fi
 
   docker run "${args[@]}" "${extra[@]}" "$image" >/dev/null
+  # Colima/virtiofs bind mounts surface /workspace with foreign ownership and
+  # git refuses "dubious" repos. ~/.gitconfig is container-fs (not a volume),
+  # so recreates land here again and re-add it to a fresh file.
+  docker exec -u dev "$PREFIX$name" git config --global --add safe.directory /workspace >/dev/null 2>&1 || true
   if [ -f "$HOME/.ssh/hive_ed25519.pub" ]; then
     inject_ssh_key "$PREFIX$name" || note "warning: could not install ssh key in $name"
   fi
