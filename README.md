@@ -4,7 +4,7 @@ Hierarchical Claude Code containers with one curated bridge to your Mac.
 
 ```
  MacBook ────────────────────────────────────────────────────────────────
- │  hive CLI · VS Code attach · config/ (the two curated files)
+ │  hive CLI · config/ (the two curated files)
  │
  │   docker         ┌────────────────────────────────────────────┐
  │   socket ──────► │ root        control plane (docker CLI +    │
@@ -50,7 +50,6 @@ hive new blog --github         # ...+ first commit, private repo <you>/blog on G
 hive sh api                    # zsh inside
 hive claude api                # interactive claude inside
 hive claude api -p "run the tests and summarize failures"   # headless
-hive code api                  # VS Code attached to the node: Claude Code extension runs inside
 hive tree                      # see the hierarchy
 hive rm api --purge            # remove node + its workspace volume
 ```
@@ -81,26 +80,10 @@ start but only where unset — edit a node's `settings.json` to make that node
 ask again. The disclaimer key is not documented by Anthropic; it is what the
 installed CLI checks, and if it changes the cost is one extra dialog.
 
-## VS Code: the Claude Code extension inside a node
+## VS Code
 
-```sh
-hive code api
-```
-
-Attaches VS Code to the running node (Dev Containers → "Attach to Running
-Container"; no `.devcontainer`, nothing built). The VS Code server and the
-Claude Code extension install *inside* the node, so the extension drives the
-node's own `claude`, credentials and tools, on `/workspace`. `hive code` writes
-the attach config once, to
-`~/Library/Application Support/Code/User/globalStorage/ms-vscode-remote.remote-containers/nameConfigs/hive-<node>.json`:
-user `dev` (the container's Docker-level user is root — the entrypoint drops
-privileges itself, VS Code would not), folder `/workspace`, the extension, and
-its two bypass-permissions settings (machine-scoped in VS Code, so they have to
-live on the container side). VS Code drives docker with the *current* context;
-`hive code` warns when that differs from the one hive is pinned to.
-
-`hive devcontainer <dir>` is the inverse: a `.devcontainer/devcontainer.json`
-the repo carries, where VS Code creates and owns the node.
+`hive devcontainer <dir>` writes a `.devcontainer/devcontainer.json` the repo carries,
+where VS Code creates and owns the node.
 
 ## The hierarchy
 

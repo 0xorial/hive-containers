@@ -1,7 +1,6 @@
 // A node that VS Code creates and owns ("Dev Containers: Reopen in Container";
-// run `hive up` first). The usual path is the other way round: `hive new <name>`
-// then `hive code <name>` attaches VS Code to a node hive created. Use this one
-// when the repo itself should carry its container definition.
+// run `hive up` first). The usual path is `hive new <name>`; use this one when
+// the repo itself should carry its container definition.
 // Mirrors `hive new`: per-node ~/.claude and ~/.ssh volumes, hive/dev image,
 // host gateway, restart policy, labels + env so `hive <name> github on` etc.
 // work on it. No nested docker engine (use `hive new` for --dind).

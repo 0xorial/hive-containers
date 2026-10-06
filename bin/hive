@@ -96,7 +96,7 @@ per-node switches (live — applied to the running container, no recreate)
   hive <node> dind on|off|status       nested docker engine (recreates the node)
   hive <node> docker on|off|status     mount the host Docker socket instead (recreates; turns dind off)
   hive <node> status                   show github + host + dind + docker state
-  hive <node> sh|claude|code [...]     same as 'hive sh|claude|code <node>'
+  hive <node> sh|claude [...]          same as 'hive sh <node>' / 'hive claude <node>'
 
 run commands on the Mac from a node (deliberate, opt-in hole)
   hive hostd start|stop|status|logs    the Mac-side daemon
@@ -107,10 +107,6 @@ desktop app / direct ssh
   hive ssh setup                   one-time: key + ~/.ssh/config + install into nodes
                                    (then: desktop app -> add SSH connection 'hive-<node>')
   hive ssh <node>                  plain ssh into a node (rides docker exec, no open port)
-
-vs code (Claude Code extension running inside the node)
-  hive code <node>                 attach VS Code to a running node's /workspace
-                                   (extension installed in the node; bypass permissions on)
 
 private github (no token pasting — hive logs you in once)
   hive <node> github on            logs you in via browser the first time, caches
@@ -534,7 +530,6 @@ cmd_new() {
   if [ "$dind" = 1 ]; then echo "  (nested dockerd starting — 'docker ps' inside works in a few seconds)"; fi
   echo "  hive sh $name            # shell"
   echo "  hive claude $name        # claude"
-  echo "  hive code $name          # VS Code attached (Claude Code extension inside the node)"
   if [ "$github" != 1 ]; then
     echo "  hive $name github on     # give it your github token (+ private repo <you>/$name)"
   fi
@@ -1107,55 +1102,6 @@ cmd_doctor() {
 
 # ---------------- devcontainer ----------------
 
-# VS Code attached to a running node (Dev Containers: "Attach to Running
-# Container"; no .devcontainer, nothing built). VS Code installs its server and
-# the Claude Code extension *inside* the node, so the extension drives the
-# node's own claude, credentials and tools on /workspace. The attach config is
-# written once per node: user 'dev' (the container's Docker-level user is root
-# because the entrypoint drops privileges itself — VS Code would not), the
-# folder, the extension, and its bypass-permissions settings (machine-scoped in
-# VS Code, so they must live on the container side, not in Mac user settings).
-cmd_code() {
-  local node=${1:-} c dir cfg hex folder
-  if [ -z "$node" ]; then die "usage: hive code <node>"; fi
-  c="$PREFIX$node"
-  docker container inspect "$c" >/dev/null 2>&1 || die "no such node: $node"
-  if [ "$(docker container inspect -f '{{.State.Running}}' "$c")" != true ]; then die "$node is not running"; fi
-  # the project's own path on terra's dev VM (HIVE_REAL_PATHS, #53), else /workspace: sessions
-  # started from VS Code are then stored with the project's other sessions
-  folder=$(node_dir "$node")
-  command -v code >/dev/null 2>&1 || die "'code' not on PATH — VS Code: Shell Command: Install 'code' command in PATH"
-  case "$(uname -s)" in
-    Darwin) dir="$HOME/Library/Application Support/Code/User/globalStorage/ms-vscode-remote.remote-containers/nameConfigs" ;;
-    *)      dir="$HOME/.config/Code/User/globalStorage/ms-vscode-remote.remote-containers/nameConfigs" ;;
-  esac
-  cfg="$dir/$c.json"
-  if [ ! -f "$cfg" ]; then
-    mkdir -p "$dir"
-    cat > "$cfg" <<EOF
-{
-  "workspaceFolder": "$folder",
-  "remoteUser": "dev",
-  "extensions": ["anthropic.claude-code"],
-  "settings": {
-    "claudeCode.allowDangerouslySkipPermissions": true,
-    "claudeCode.initialPermissionMode": "bypassPermissions"
-  }
-}
-EOF
-    echo "wrote attach config: $cfg"
-  fi
-  # The attached-container authority is hex-encoded JSON — a bare container
-  # name decodes but is rejected as "it no longer exists". Embedding hive's
-  # docker context also pins VS Code to the right engine, whatever its default.
-  local json="{\"containerName\":\"/$c\"}"
-  if [ -n "${DOCKER_CONTEXT:-}" ]; then
-    json="{\"containerName\":\"/$c\",\"settings\":{\"context\":\"$DOCKER_CONTEXT\"}}"
-  fi
-  hex=$(printf '%s' "$json" | od -An -tx1 | tr -d ' \n')
-  code --folder-uri "vscode-remote://attached-container+$hex$folder"
-}
-
 cmd_devcontainer() {
   if [ $# -lt 1 ]; then die "usage: hive devcontainer <project-dir>"; fi
   local dir=$1 dest
@@ -1193,7 +1139,6 @@ case $cmd in
   token)         cmd_token "$@" ;;
   hostd)         cmd_hostd "$@" ;;
   devcontainer)  cmd_devcontainer "$@" ;;
-  code)          cmd_code "$@" ;;
   help|-h|--help) usage ;;
   *)
     # per-node form: hive <node> <verb> [...]
@@ -1209,7 +1154,6 @@ case $cmd in
         recreate)   cmd_node_recreate "$cmd" ;;
         sh)         cmd_sh          "$cmd" "$@" ;;
         claude)     cmd_claude      "$cmd" "$@" ;;
-        code)       cmd_code        "$cmd" ;;
         status)     cmd_node_status "$cmd" ;;
         *) die "unknown verb '$verb' for node '$cmd' (github|host|dind|docker|token|recreate|sh|claude|code|status)" ;;
       esac
