@@ -1,21 +1,42 @@
-// Joins this project to the hive as a node (run `hive up` first).
-// VS Code / Cursor: "Dev Containers: Reopen in Container".
+// A node that VS Code creates and owns ("Dev Containers: Reopen in Container";
+// run `hive up` first). The usual path is the other way round: `hive new <name>`
+// then `hive code <name>` attaches VS Code to a node hive created. Use this one
+// when the repo itself should carry its container definition.
+// Mirrors `hive new`: per-node ~/.claude and ~/.ssh volumes, hive/dev image,
+// host gateway, restart policy, labels + env so `hive <name> github on` etc.
+// work on it. No nested docker engine (use `hive new` for --dind).
 {
 	"name": "hive: ${localWorkspaceFolderBasename}",
-	"image": "hive/node",
+	"image": "hive/dev",
 	"runArgs": [
 		"--name=hive-${localWorkspaceFolderBasename}",
 		"--hostname=${localWorkspaceFolderBasename}",
 		"--network=hive-net",
+		"--add-host=host.docker.internal:host-gateway",
+		"--restart=unless-stopped",
 		"--label=hive.role=node",
 		"--label=hive.name=${localWorkspaceFolderBasename}",
 		"--label=hive.parent=root"
 	],
+	"containerEnv": {
+		"HIVE_NAME": "${localWorkspaceFolderBasename}",
+		"HIVE_PARENT": "root"
+	},
 	"remoteUser": "dev",
 	"workspaceMount": "source=${localWorkspaceFolder},target=/workspace,type=bind",
 	"workspaceFolder": "/workspace",
 	"mounts": [
 		"source=hive-shared,target=/shared,type=volume",
-		"source=hive-claude,target=/home/dev/.claude,type=volume"
-	]
+		"source=hive-claude-${localWorkspaceFolderBasename},target=/home/dev/.claude,type=volume",
+		"source=hive-ssh-${localWorkspaceFolderBasename},target=/home/dev/.ssh,type=volume"
+	],
+	"customizations": {
+		"vscode": {
+			"extensions": ["anthropic.claude-code"],
+			"settings": {
+				"claudeCode.allowDangerouslySkipPermissions": true,
+				"claudeCode.initialPermissionMode": "bypassPermissions"
+			}
+		}
+	}
 }

@@ -46,9 +46,11 @@ hive doctor                    # verify the isolation actually holds
 
 hive new api                   # spawn a node (fresh volume workspace)
 hive new web --bind ~/code/web # ...or mount a Mac directory as /workspace
+hive new blog --github         # ...+ first commit, private repo <you>/blog on GitHub, pushed
 hive sh api                    # zsh inside
 hive claude api                # interactive claude inside
 hive claude api -p "run the tests and summarize failures"   # headless
+hive code api                  # VS Code attached to the node: Claude Code extension runs inside
 hive tree                      # see the hierarchy
 hive rm api --purge            # remove node + its workspace volume
 ```
@@ -67,6 +69,38 @@ always accurate after any restart or rebuild — nothing to maintain by hand.
 This lives on the container's own filesystem, so it never collides via the
 shared `~/.claude` volume nor clutters your bind-mounted `/workspace`. Confirm
 it's loaded inside a session with `/memory`.
+
+## Permissions: nodes run Claude with everything allowed
+
+Every hive container seeds its own `~/.claude/settings.json` with
+`permissions.defaultMode = bypassPermissions` and pre-accepts the one-time
+bypass disclaimer (`bypassPermissionsModeAccepted` in `.claude.json`), so
+`claude`, desktop-app SSH sessions and the VS Code extension all start with no
+approval prompts. The container is the sandbox. Both keys are seeded on every
+start but only where unset — edit a node's `settings.json` to make that node
+ask again. The disclaimer key is not documented by Anthropic; it is what the
+installed CLI checks, and if it changes the cost is one extra dialog.
+
+## VS Code: the Claude Code extension inside a node
+
+```sh
+hive code api
+```
+
+Attaches VS Code to the running node (Dev Containers → "Attach to Running
+Container"; no `.devcontainer`, nothing built). The VS Code server and the
+Claude Code extension install *inside* the node, so the extension drives the
+node's own `claude`, credentials and tools, on `/workspace`. `hive code` writes
+the attach config once, to
+`~/Library/Application Support/Code/User/globalStorage/ms-vscode-remote.remote-containers/nameConfigs/hive-<node>.json`:
+user `dev` (the container's Docker-level user is root — the entrypoint drops
+privileges itself, VS Code would not), folder `/workspace`, the extension, and
+its two bypass-permissions settings (machine-scoped in VS Code, so they have to
+live on the container side). VS Code drives docker with the *current* context;
+`hive code` warns when that differs from the one hive is pinned to.
+
+`hive devcontainer <dir>` is the inverse: a `.devcontainer/devcontainer.json`
+the repo carries, where VS Code creates and owns the node.
 
 ## The hierarchy
 
@@ -164,7 +198,7 @@ hive itself, then asks the Mac to redeploy the running hive — there's a
 deliberate, opt-in channel:
 
 ```sh
-hive hostd start            # Mac: start the daemon + a bridge forward
+hive hostd start            # Mac: start the foreground approval console (keep it open)
 hive <node> host on         # bless a node (live — injects a secret token)
 # then, inside that node:
 host "cd ~/hive-containers && git pull && hive build && hive up"
@@ -175,17 +209,22 @@ remove the token in the running container, no recreate. `hive new x --host` is
 just sugar for new + host on.
 
 How it works: `host <cmd>` POSTs the command (with the node's private token) to
-the Mac daemon via `bridge:8765`; the daemon runs it **as you** and returns the
-output. The daemon binds **loopback only** (`127.0.0.1`) — Colima's host gateway
-forwards arrive there — so the command port is never exposed on your LAN, only
-through the bridge. Every command is logged (`hive hostd logs`). Default working
-directory is your hive checkout, so deploy one-liners are short.
+the Mac daemon, which **prompts you to approve it at the `hive hostd` terminal**
+before anything runs. Approve and it executes **as you**, returning the output;
+deny and you can type a short message that is sent back to the asking node's
+model (its `host` call exits non-zero with your message on stderr) so it learns
+why and what to do instead. The daemon binds **loopback only** (`127.0.0.1`) —
+Colima's host gateway forwards arrive there — so the command port is never
+exposed on your LAN. Every decision is logged (`hive hostd logs`). Default
+working directory is your hive checkout, so deploy one-liners are short.
 
-> ⚠️ **This is real remote code execution on your Mac.** A `host on` node can run
-> *anything* as your user — combined with `github on`, a compromised node could
-> push code and have your Mac run it. It is **off by default**, gated by a secret
-> token that lives only inside blessed nodes, and bound to loopback — but treat
-> any `host on` node as fully trusted, and `host off` it when you're done.
+> ⚠️ **This is real remote code execution on your Mac** — gated by your approval.
+> Keep the `hive hostd` window where you can see it: that prompt is the only thing
+> standing between a node and your user account, so approve only commands you
+> understand. A `host on` node combined with `github on` is especially sensitive
+> (a bad commit it pushes could be the very next thing it asks you to run). Still
+> **off by default** and gated by a secret token that lives only inside blessed
+> nodes — `host off` a node when you're done with it.
 
 ## Develop hive inside hive (nested Docker)
 

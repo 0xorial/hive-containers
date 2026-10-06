@@ -78,14 +78,16 @@ nodes
                                    (default: <config/bind-root>/<name> when set,
                                     else named volume hive-ws-<name>)
        --no-bind                   force a volume workspace despite bind-root
-       --image <img>               alternate image (default: hive/node)
-       --dind                      nested docker engine (privileged; uses hive/dev)
-       --docker                    mount the host Docker socket (use the host engine; uses hive/dev)
+       --image <img>               alternate image (default: hive/dev)
+       --dind                      nested docker engine, privileged (DEFAULT)
+       --no-dind                   plain node, no nested docker engine
+       --docker                    use the host Docker socket instead of dind
+       --github                    + first commit + 'github on': private repo <you>/<name>, pushed
   hive ls                          list containers + guests on hive-net
   hive tree                        show the hierarchy
   hive sh [name] [cmd...]          shell into a node (default: root)
   hive claude <name> [args...]     run claude in a node (e.g. -p "fix tests")
-  hive rm <name>... [--purge]      remove node(s); --purge drops claude+dind volumes (workspace volume is always kept)
+  hive rm <name>... [--purge]      remove node(s); --purge drops claude+dind+ssh volumes (workspace volume is always kept)
   hive join <container>            attach an existing container to the hive network
 
 per-node switches (live — applied to the running container, no recreate)
@@ -94,7 +96,7 @@ per-node switches (live — applied to the running container, no recreate)
   hive <node> dind on|off|status       nested docker engine (recreates the node)
   hive <node> docker on|off|status     mount the host Docker socket instead (recreates; turns dind off)
   hive <node> status                   show github + host + dind + docker state
-  hive <node> sh|claude [...]          same as 'hive sh <node>' / 'hive claude <node>'
+  hive <node> sh|claude|code [...]     same as 'hive sh|claude|code <node>'
 
 run commands on the Mac from a node (deliberate, opt-in hole)
   hive hostd start|stop|status|logs    the Mac-side daemon
@@ -105,6 +107,10 @@ desktop app / direct ssh
   hive ssh setup                   one-time: key + ~/.ssh/config + install into nodes
                                    (then: desktop app -> add SSH connection 'hive-<node>')
   hive ssh <node>                  plain ssh into a node (rides docker exec, no open port)
+
+vs code (Claude Code extension running inside the node)
+  hive code <node>                 attach VS Code to a running node's /workspace
+                                   (extension installed in the node; bypass permissions on)
 
 private github (no token pasting — hive logs you in once)
   hive <node> github on            logs you in via browser the first time, caches
@@ -341,24 +347,49 @@ revoke_write_access() {
   docker exec -u dev "$c" bash -c 'rm -f ~/.ssh/hive_deploy ~/.ssh/hive_deploy.pub' 2>/dev/null || true
 }
 
+# Commits made inside a node (yours or Claude's) need an identity. Copy the
+# Mac's global one in unless the node already set its own.
+inject_git_identity() {
+  local c=$1 n e
+  n=$(git config --global user.name 2>/dev/null || true)
+  e=$(git config --global user.email 2>/dev/null || true)
+  if [ -z "$n" ] || [ -z "$e" ]; then return 0; fi
+  if docker exec -u dev "$c" git config --global user.name >/dev/null 2>&1; then return 0; fi
+  docker exec -u dev "$c" git config --global user.name "$n" >/dev/null 2>&1 || true
+  docker exec -u dev "$c" git config --global user.email "$e" >/dev/null 2>&1 || true
+}
+
+# First commit of a freshly scaffolded project so `github on` has a main to
+# push. Only reached for a brand-new empty dir via `hive new --github`.
+first_commit() {
+  local c="$PREFIX$1"
+  docker exec -u dev "$c" bash -lc '
+    cd /workspace
+    git rev-parse --verify HEAD >/dev/null 2>&1 && exit 0
+    git add -A && git commit -q -m "hive: scaffold project" && echo "  committed scaffold"
+  '
+}
+
 cmd_new() {
-  if [ $# -lt 1 ]; then die "usage: hive new <name> [--parent p] [--bind dir] [--image img] [--dind|--docker] [-- docker args]"; fi
+  if [ $# -lt 1 ]; then die "usage: hive new <name> [--parent p] [--bind dir] [--image img] [--dind|--no-dind|--docker] [-- docker args]"; fi
   local name=$1; shift
   if ! [[ "$name" =~ ^[a-z0-9][a-z0-9_-]*$ ]]; then
     die "name must be lowercase alphanumeric plus '-' or '_'"
   fi
 
-  local parent=root bind="" image=$NODE_IMAGE host=0 dind=0 dockmount=0 image_set=0 nobind=0
+  local parent=root bind="" image=$DEV_IMAGE host=0 dind=1 dind_set=0 dockmount=0 nobind=0 github=0
   local extra=()
   while [ $# -gt 0 ]; do
     case $1 in
       --parent) parent=$2; shift 2 ;;
       --bind)   bind=$2;   shift 2 ;;
       --no-bind) nobind=1; shift ;;
-      --image)  image=$2; image_set=1; shift 2 ;;
+      --image)  image=$2; shift 2 ;;
       --host)   host=1;    shift ;;
-      --dind)   dind=1;    shift ;;
-      --docker) dockmount=1; shift ;;
+      --github) github=1;  shift ;;
+      --dind)    dind=1; dind_set=1; shift ;;
+      --no-dind) dind=0; dind_set=1; shift ;;
+      --docker)  dockmount=1; shift ;;
       --) shift; extra=("$@"); break ;;
       *) die "unknown option '$1' (use -- to pass raw docker run args)" ;;
     esac
@@ -370,17 +401,20 @@ cmd_new() {
     bind="$BIND_ROOT/$name"
     note "binding /workspace to $bind (config/bind-root; --no-bind for a volume)"
   fi
-  if [ "$dind" = 1 ] && [ "$dockmount" = 1 ]; then
-    die "--dind and --docker are mutually exclusive (both bind /var/run/docker.sock)"
-  fi
-  # dind needs the engine; --docker needs the client. Both ship in the dev image,
-  # so default to it unless an explicit --image was given.
-  if [ "$dind" = 1 ] || [ "$dockmount" = 1 ]; then
-    [ "$image_set" = 0 ] && image=$DEV_IMAGE
-    if ! docker image inspect "$image" >/dev/null 2>&1; then
-      note "building $image (provides the docker client/engine)…"
-      docker build -f "$HIVE_HOME/images/dev/Dockerfile" -t "$DEV_IMAGE" "$HIVE_HOME" >/dev/null
+  # --docker drives the host engine over the mounted socket, so it turns dind
+  # off; only a *deliberate* --dind alongside --docker is a real conflict.
+  if [ "$dockmount" = 1 ]; then
+    if [ "$dind_set" = 1 ] && [ "$dind" = 1 ]; then
+      die "--dind and --docker are mutually exclusive (both bind /var/run/docker.sock)"
     fi
+    dind=0
+  fi
+  # Every node ships the docker client/engine (hive/dev) by default so `docker`
+  # just works: dind nodes use the nested engine, --docker/project nodes the host
+  # socket. Build the dev image on demand if it isn't present yet.
+  if [ "$image" = "$DEV_IMAGE" ] && ! docker image inspect "$image" >/dev/null 2>&1; then
+    note "building $DEV_IMAGE (provides the docker client/engine)…"
+    docker build -f "$HIVE_HOME/images/dev/Dockerfile" -t "$DEV_IMAGE" "$HIVE_HOME" >/dev/null
   fi
 
   if docker container inspect "$PREFIX$name" >/dev/null 2>&1; then
@@ -395,7 +429,8 @@ cmd_new() {
     --restart unless-stopped
     --label hive.role=node --label "hive.name=$name" --label "hive.parent=$parent"
     -e "HIVE_NAME=$name" -e "HIVE_PARENT=$parent"
-    -v hive-shared:/shared -v "hive-claude-$name:/home/dev/.claude")
+    -v hive-shared:/shared -v "hive-claude-$name:/home/dev/.claude"
+    -v "hive-ssh-$name:/home/dev/.ssh")
 
   # HIVE_CLAUDE_ROOT (set only in terra's dev VM, terra-config #52): the node's ~/.claude is the
   # folder <root>/nodes/<name> on a snapshotted dataset instead of the hive-claude-<name> volume,
@@ -461,11 +496,17 @@ cmd_new() {
 
   # host Docker access: project nodes (--bind) get it automatically; --docker
   # requests it explicitly so the node drives the host engine, not a nested one.
-  if [ "$project" = 1 ] || [ "$dockmount" = 1 ]; then
+  # The host Docker socket is opt-in via --docker (which forces dind off). Every
+  # other node — now including project --bind nodes — runs its own nested engine.
+  if [ "$dockmount" = 1 ]; then
     args+=(-v /var/run/docker.sock:/var/run/docker.sock)
   fi
 
   docker run "${args[@]}" "${extra[@]}" "$image" >/dev/null
+  # ~/.ssh is a persisted per-node volume so the github deploy key (hive_deploy)
+  # survives recreates; a brand-new volume mounts root-owned, so normalize it
+  # (inject_ssh_key also chowns, but only when an access key is configured).
+  docker exec -u root "$PREFIX$name" install -d -o dev -g dev -m 700 /home/dev/.ssh >/dev/null 2>&1 || true
   # Colima/virtiofs bind mounts surface /workspace with foreign ownership and
   # git refuses "dubious" repos. ~/.gitconfig is container-fs (not a volume),
   # so recreates land here again and re-add it to a fresh file.
@@ -473,6 +514,7 @@ cmd_new() {
   if [ "${HIVE_REAL_PATHS:-}" = 1 ] && [ -n "$bind" ]; then
     docker exec -u dev "$PREFIX$name" git config --global --add safe.directory "$bind" >/dev/null 2>&1 || true
   fi
+  inject_git_identity "$PREFIX$name"
   if [ -f "$HOME/.ssh/hive_ed25519.pub" ]; then
     inject_ssh_key "$PREFIX$name" || note "warning: could not install ssh key in $name"
   fi
@@ -482,11 +524,20 @@ cmd_new() {
   if [ "$project" = 1 ]; then
     setup_project "$name" "$fresh"
   fi
+  # --github: one-command project. A fresh scaffold gets its first commit so
+  # `github on` (private repo, deploy key, origin) has a main to push.
+  if [ "$github" = 1 ]; then
+    if [ "$fresh" = 1 ]; then first_commit "$name"; fi
+    cmd_node_github "$name" on
+  fi
   echo "node '$name' up (parent: $parent)."
   if [ "$dind" = 1 ]; then echo "  (nested dockerd starting — 'docker ps' inside works in a few seconds)"; fi
   echo "  hive sh $name            # shell"
   echo "  hive claude $name        # claude"
-  echo "  hive $name github on     # give it your github token"
+  echo "  hive code $name          # VS Code attached (Claude Code extension inside the node)"
+  if [ "$github" != 1 ]; then
+    echo "  hive $name github on     # give it your github token (+ private repo <you>/$name)"
+  fi
 }
 
 cmd_ls() {
@@ -642,8 +693,12 @@ recreate_node() {
   if [ -n "$image" ] && [ "$image" != "$NODE_IMAGE" ] && [ "$image" != "$DEV_IMAGE" ]; then
     nargs+=(--image "$image")
   fi
-  if [ "$want_dind" = 1 ]; then nargs+=(--dind); fi
-  if [ "$want_dock" = 1 ]; then nargs+=(--docker); fi
+  # Pin the engine mode explicitly: cmd_new now defaults dind ON, so a node that
+  # was dind-off (and not on the host socket) must pass --no-dind or it'd
+  # silently gain a nested engine on recreate.
+  if [ "$want_dind" = 1 ]; then nargs+=(--dind)
+  elif [ "$want_dock" = 1 ]; then nargs+=(--docker)
+  else nargs+=(--no-dind); fi
   # NOTE: raw `-- <docker run args>` from the original `hive new` are not replayed
   # here (they can't be recovered from `docker inspect`).
   HIVE_RECREATE=1; cmd_new "$node" "${nargs[@]}" >/dev/null; unset HIVE_RECREATE
@@ -769,6 +824,9 @@ cmd_rm() {
       fi
       if docker volume rm "hive-claude-$n" >/dev/null 2>&1; then
         echo "purged volume hive-claude-$n"
+      fi
+      if docker volume rm "hive-ssh-$n" >/dev/null 2>&1; then
+        echo "purged volume hive-ssh-$n"
       fi
       if docker volume inspect "hive-ws-$n" >/dev/null 2>&1; then
         echo "kept workspace volume hive-ws-$n (remove manually if you truly want it gone)"
@@ -1049,6 +1107,52 @@ cmd_doctor() {
 
 # ---------------- devcontainer ----------------
 
+# VS Code attached to a running node (Dev Containers: "Attach to Running
+# Container"; no .devcontainer, nothing built). VS Code installs its server and
+# the Claude Code extension *inside* the node, so the extension drives the
+# node's own claude, credentials and tools on /workspace. The attach config is
+# written once per node: user 'dev' (the container's Docker-level user is root
+# because the entrypoint drops privileges itself — VS Code would not), the
+# folder, the extension, and its bypass-permissions settings (machine-scoped in
+# VS Code, so they must live on the container side, not in Mac user settings).
+cmd_code() {
+  local node=${1:-} c dir cfg hex
+  if [ -z "$node" ]; then die "usage: hive code <node>"; fi
+  c="$PREFIX$node"
+  docker container inspect "$c" >/dev/null 2>&1 || die "no such node: $node"
+  if [ "$(docker container inspect -f '{{.State.Running}}' "$c")" != true ]; then die "$node is not running"; fi
+  command -v code >/dev/null 2>&1 || die "'code' not on PATH — VS Code: Shell Command: Install 'code' command in PATH"
+  case "$(uname -s)" in
+    Darwin) dir="$HOME/Library/Application Support/Code/User/globalStorage/ms-vscode-remote.remote-containers/nameConfigs" ;;
+    *)      dir="$HOME/.config/Code/User/globalStorage/ms-vscode-remote.remote-containers/nameConfigs" ;;
+  esac
+  cfg="$dir/$c.json"
+  if [ ! -f "$cfg" ]; then
+    mkdir -p "$dir"
+    cat > "$cfg" <<'EOF'
+{
+  "workspaceFolder": "/workspace",
+  "remoteUser": "dev",
+  "extensions": ["anthropic.claude-code"],
+  "settings": {
+    "claudeCode.allowDangerouslySkipPermissions": true,
+    "claudeCode.initialPermissionMode": "bypassPermissions"
+  }
+}
+EOF
+    echo "wrote attach config: $cfg"
+  fi
+  # The attached-container authority is hex-encoded JSON — a bare container
+  # name decodes but is rejected as "it no longer exists". Embedding hive's
+  # docker context also pins VS Code to the right engine, whatever its default.
+  local json="{\"containerName\":\"/$c\"}"
+  if [ -n "${DOCKER_CONTEXT:-}" ]; then
+    json="{\"containerName\":\"/$c\",\"settings\":{\"context\":\"$DOCKER_CONTEXT\"}}"
+  fi
+  hex=$(printf '%s' "$json" | od -An -tx1 | tr -d ' \n')
+  code --folder-uri "vscode-remote://attached-container+$hex/workspace"
+}
+
 cmd_devcontainer() {
   if [ $# -lt 1 ]; then die "usage: hive devcontainer <project-dir>"; fi
   local dir=$1 dest
@@ -1086,6 +1190,7 @@ case $cmd in
   token)         cmd_token "$@" ;;
   hostd)         cmd_hostd "$@" ;;
   devcontainer)  cmd_devcontainer "$@" ;;
+  code)          cmd_code "$@" ;;
   help|-h|--help) usage ;;
   *)
     # per-node form: hive <node> <verb> [...]
@@ -1101,8 +1206,9 @@ case $cmd in
         recreate)   cmd_node_recreate "$cmd" ;;
         sh)         cmd_sh          "$cmd" "$@" ;;
         claude)     cmd_claude      "$cmd" "$@" ;;
+        code)       cmd_code        "$cmd" ;;
         status)     cmd_node_status "$cmd" ;;
-        *) die "unknown verb '$verb' for node '$cmd' (github|host|dind|docker|token|recreate|sh|claude|status)" ;;
+        *) die "unknown verb '$verb' for node '$cmd' (github|host|dind|docker|token|recreate|sh|claude|code|status)" ;;
       esac
     else
       echo "hive: unknown command or node: $cmd" >&2

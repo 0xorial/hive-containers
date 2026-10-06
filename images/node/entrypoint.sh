@@ -22,6 +22,32 @@ if [ "$(id -u)" -eq 0 ]; then
     printf 'export DISABLE_AUTOUPDATER=1\n'
   } > /etc/hive-env.sh
 
+  # Permissions: every session in a hive container runs with everything
+  # allowed (= --dangerously-skip-permissions); the container is the sandbox.
+  # Seeded into this container's own ~/.claude volume, and only where unset,
+  # so editing a node's settings.json makes that node ask again.
+  #  - settings.json: permissions.defaultMode = bypassPermissions (documented;
+  #    honored by the CLI, ssh/desktop sessions and the VS Code extension).
+  #  - .claude.json: bypassPermissionsModeAccepted = true pre-accepts the
+  #    one-time bypass disclaimer. Undocumented key, but it is exactly what the
+  #    installed CLI checks; if it ever changes, the cost is one extra dialog.
+  cfg="${CLAUDE_CONFIG_DIR:-/home/dev/.claude}"
+  mkdir -p "$cfg"
+  seed_json() {  # file  jq-filter-to-test  jq-filter-to-apply
+    local f=$1 test=$2 apply=$3
+    [ -s "$f" ] || echo '{}' > "$f"
+    if [ "$(jq -r "$test" "$f" 2>/dev/null)" != true ]; then
+      if jq "$apply" "$f" > "$f.tmp" 2>/dev/null; then mv "$f.tmp" "$f"
+      else rm -f "$f.tmp"; echo "node: warning: could not seed $f (not valid JSON?)" >&2; fi
+    fi
+    chown dev:dev "$f" 2>/dev/null || true
+  }
+  seed_json "$cfg/settings.json" '.permissions.defaultMode != null' \
+            '.permissions.defaultMode = "bypassPermissions"'
+  seed_json "$cfg/.claude.json" '.bypassPermissionsModeAccepted == true' \
+            '.bypassPermissionsModeAccepted = true'
+  chmod 600 "$cfg/.claude.json" 2>/dev/null || true
+
   # Tell this container's Claude where it is. /etc/claude-code/CLAUDE.md is the
   # Linux "managed policy" memory path: loaded first in every session, on the
   # container's own fs (so it neither collides via the shared ~/.claude volume
@@ -39,6 +65,8 @@ if [ "$(id -u)" -eq 0 ]; then
   mkdir -p /etc/claude-code
 
   hive_net="This container has normal, direct internet access (no egress proxy or allowlist) and can reach the user's Mac at \`host.docker.internal\`."
+  hive_host_para=""
+  hive_auth_para=""
 
   if [ "$hive_role" = root ]; then
     hive_parent_line=""
@@ -61,12 +89,37 @@ EOR
 You cannot see or control other hive containers — the hive's own config lives in the control plane, not here. You have normal, direct internet access; ask the user if you need anything from the control plane.
 EOR
 )
+    hive_auth_para=$(cat <<EOR
+
+## Git auth (when \`hive ${hive_name} github on\` was run on the Mac)
+This container holds two complementary credentials for \`origin\`:
+
+- **HTTPS**: a token in \`~/.git-credentials\` (personal token from the user's \`gh\` login + a short-lived read-all token).
+- **SSH**: a per-repo deploy key at **\`~/.ssh/hive_deploy\`** with **write** access. The matching pubkey is registered on the GitHub repo as **\`hive-${hive_name}\`**, and \`~/.ssh/config\` already routes \`github.com\` through it.
+
+Use the existing files — **do not** \`ssh-keygen\` a new key, and **do not** commit either key file. \`hive_deploy\` only works for THIS container's \`origin\` (GitHub deploy keys are unique per repo); it can't push to any other repo. If \`~/.ssh/hive_deploy\` doesn't exist, \`github on\` hasn't been run yet — ask the user to run it on the Mac.
+EOR
+)
+    hive_host_para=$(cat <<'EOR'
+
+## Running commands on the user's Mac (`host`)
+If this node has been blessed (the user ran `hive <node> host on`), a `host` command is available:
+
+    host "<command…>"
+
+It runs the command **on the user's Mac, as them** — but only after they approve it interactively at their Mac terminal. Reach for it only when the task genuinely needs the Mac (their toolchain, building or installing artefacts there, driving their setup); otherwise do the work here in the container.
+
+- **Paths are Mac paths**, not container paths — `/workspace` here is a different location on the Mac. `cd` to the real Mac path inside the command.
+- The user may **deny** a command and send back a short message. A denial shows as `DENIED by the human operator` (exit 77) — that is a deliberate decision, not a transient error. Read their message and adapt, or ask; do **not** blindly retry the same command.
+- State plainly what you intend to run before using `host` for anything consequential, and don't try to route around a denial.
+EOR
+)
   fi
 
   cat > /etc/claude-code/CLAUDE.md <<EOF
 # hive — where you are
 
-You are Claude Code running inside **${hive_name}**, one container in a *hive*: a tree of dev containers on a single host (a MacBook). The user reaches you through the Claude desktop app or \`hive claude ${hive_name}\`.
+You are Claude Code running inside **${hive_name}**, one container in a *hive*: a tree of dev containers on a single host (a MacBook). The user reaches you through the Claude desktop app, \`hive claude ${hive_name}\`, or the Claude Code VS Code extension attached to this container.
 
 ## This container
 - Name: **${hive_name}**${hive_parent_line}
@@ -74,10 +127,15 @@ You are Claude Code running inside **${hive_name}**, one container in a *hive*: 
 - \`/workspace\` — your working directory
 - \`/shared\` — a volume shared with every hive container (scratch space for handing files between containers)
 
+## Permissions
+Every session here runs in bypass-permissions mode (no approval prompts) — this container is the sandbox. That makes *you* the only check on destructive actions: say what you are about to do before anything irreversible, and stay inside \`/workspace\` unless asked.
+
 ## Network
 ${hive_net}
 
 ${hive_role_para}
+${hive_auth_para}
+${hive_host_para}
 EOF
   chmod 0644 /etc/claude-code/CLAUDE.md
 
@@ -96,7 +154,10 @@ EOF
   # --privileged). dev is already in the docker group via the image.
   if [ "${HIVE_DIND:-}" = 1 ] && command -v dockerd >/dev/null 2>&1; then
     echo "node: starting nested dockerd (dind)…"
-    rm -f /var/run/docker.pid
+    # A restarted node keeps its container fs, so both pid files survive; a stale
+    # containerd.pid names some other process and dockerd then times out waiting for
+    # "containerd is still running" (seen on terra's dev VM, 2026-09-28).
+    rm -f /var/run/docker.pid /var/run/docker/containerd/containerd.pid
     setsid dockerd >/var/log/dockerd.log 2>&1 < /dev/null &
   fi
 

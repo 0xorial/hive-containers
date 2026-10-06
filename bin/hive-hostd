@@ -1,35 +1,44 @@
 #!/usr/bin/env python3
-"""hive-hostd — runs commands that blessed hive nodes request, on this Mac.
+"""hive-hostd — interactive approval console for commands that blessed hive
+nodes ask to run on this Mac.
 
-This is a deliberate hole in hive's isolation. A node turned on with
-`hive <node> host on` is handed a secret token (privately, into that node only)
-and can POST a command here; this daemon runs it *as you* and returns the
-output. Every command is logged. Treat any host-enabled node as fully trusted:
-it can run anything on your Mac.
+This is a deliberate hole in hive's isolation, but a *gated* one. A node turned
+on with `hive <node> host on` is handed a secret token and can POST a command
+here — and this daemon runs it only **after you approve it at this terminal**.
+You can deny, optionally with a message that is sent back to the asking node's
+model so it knows why and what to do instead. Every decision is logged.
 
-No token in the request = refused. The token gates everything, so keep it
-secret and only `host on` the nodes you trust. By default the daemon binds
-loopback (127.0.0.1): the bridge reaches it over the host gateway, which lands
-on loopback, so the command port is never exposed on your LAN. Override the
-bind with HIVE_HOSTD_BIND only if your gateway requires it — and if you do,
-keep your macOS firewall on.
+Run it in the foreground (`hive hostd start`) and keep it where you can see it:
+this window is where you authorize what a node may do to your Mac. No token =
+refused before you ever see a prompt; no TTY = every request denied (fail-closed).
 """
-import hmac, json, os, pathlib, subprocess, sys, time
+import hmac, json, os, pathlib, subprocess, sys, threading, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HOME = pathlib.Path.home()
 CFG = HOME / ".config" / "hive"
 TOKEN_FILE = CFG / "hostd-token"
 LOG = CFG / "hostd.log"
-# The bridge's socat forward reaches us over Colima's host gateway, which lands
-# on loopback — so bind 127.0.0.1 and the RCE port is never exposed on the LAN.
+# The bridge / host-gateway forward reaches us over Colima's host gateway, which
+# lands on loopback — so bind 127.0.0.1 and the RCE port is never exposed on the LAN.
 BIND = os.environ.get("HIVE_HOSTD_BIND", "127.0.0.1")
 PORT = int(os.environ.get("HIVE_HOSTD_PORT", "8765"))
 # commands run here by default (the Mac's hive checkout), so `git pull && hive up` just works
 WORKDIR = os.environ.get("HIVE_HOSTD_CWD") or str(pathlib.Path(__file__).resolve().parent.parent)
-MAX_SECONDS = int(os.environ.get("HIVE_HOSTD_TIMEOUT", "1800"))
+MAX_SECONDS = int(os.environ.get("HIVE_HOSTD_TIMEOUT", "7200"))
 
 TOKEN = TOKEN_FILE.read_text().strip()
+
+# One command is adjudicated AND run at a time: the operator has one terminal and
+# one pair of eyes, so prompts must not interleave and stdin must not be contended
+# by concurrent request threads. /health (GET) never takes this lock, so status
+# checks stay responsive even while a long command runs.
+APPROVAL_LOCK = threading.Lock()
+HAVE_TTY = sys.stdin.isatty() and sys.stdout.isatty()
+
+BOLD, DIM, RED, GRN, YEL, RST = "\033[1m", "\033[2m", "\033[31m", "\033[32m", "\033[33m", "\033[0m"
+if not HAVE_TTY:
+    BOLD = DIM = RED = GRN = YEL = RST = ""
 
 
 def log(msg):
@@ -39,7 +48,44 @@ def log(msg):
             f.write(line + "\n")
     except OSError:
         pass
-    print("hostd: " + msg, file=sys.stderr, flush=True)
+
+
+def safe(s):
+    """Render untrusted text for the terminal: escape control chars so a node
+    cannot inject ANSI escapes to spoof, hide, or relocate the prompt."""
+    return "".join(ch if (ch.isprintable() and ch != "\x7f") else repr(ch)[1:-1] for ch in str(s))
+
+
+def prompt_operator(node, src, cwd, cmd):
+    """Ask the human to approve. Returns (approved: bool, reason: str)."""
+    if not HAVE_TTY:
+        log("DENIED (no tty to prompt operator)")
+        return False, ("the Mac approval console has no terminal attached, so this command "
+                       "could not be reviewed — ask the user to run `hive hostd start` in a "
+                       "foreground terminal")
+    bar = "─" * 72
+    sys.stdout.write(
+        f"\n{YEL}{bar}{RST}\n"
+        f"{BOLD}host request{RST}   node={safe(node)}   src={safe(src)}\n"
+        f"  cwd: {safe(cwd)}\n"
+        f"  {BOLD}command:{RST}\n"
+    )
+    for line in cmd.split("\n"):
+        sys.stdout.write(f"    {BOLD}{safe(line)}{RST}\n")
+    sys.stdout.write(f"{YEL}{bar}{RST}\n")
+    sys.stdout.write(f"  run this on your Mac? type {GRN}{BOLD}y{RST} to allow — anything else denies: ")
+    sys.stdout.flush()
+    ans = sys.stdin.readline()
+    if ans.strip().lower() in ("y", "yes"):
+        sys.stdout.write(f"  {GRN}→ approved{RST}\n\n")
+        sys.stdout.flush()
+        return True, ""
+    sys.stdout.write(f"  {RED}→ denied{RST}. message to send back to the node (optional, Enter to skip): ")
+    sys.stdout.flush()
+    reason = sys.stdin.readline().strip()
+    sys.stdout.write("\n")
+    sys.stdout.flush()
+    return False, reason
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -71,16 +117,22 @@ class Handler(BaseHTTPRequestHandler):
         cmd = req.get("cmd", "")
         if not cmd:
             return self._send(400, {"error": "empty command"})
+        node = req.get("node") or "?"          # self-reported by the node (shared token can't attribute)
         cwd = req.get("cwd") or WORKDIR
-        log(f"RUN {src} (cwd={cwd}): {cmd}")
-        try:
-            p = subprocess.run(["bash", "-lc", cmd], cwd=cwd,
-                               capture_output=True, text=True, timeout=MAX_SECONDS)
-            log(f"DONE {src} exit={p.returncode}")
-            self._send(200, {"exit": p.returncode, "stdout": p.stdout, "stderr": p.stderr})
-        except subprocess.TimeoutExpired:
-            log(f"TIMEOUT {src}")
-            self._send(200, {"exit": 124, "stdout": "", "stderr": f"timed out after {MAX_SECONDS}s"})
+        with APPROVAL_LOCK:
+            approved, reason = prompt_operator(node, src, cwd, cmd)
+            if not approved:
+                log(f"DENIED-BY-OPERATOR node={node} src={src} reason={reason!r}: {cmd}")
+                return self._send(200, {"denied": True, "reason": reason})
+            log(f"APPROVED node={node} src={src} (cwd={cwd}): {cmd}")
+            try:
+                p = subprocess.run(["bash", "-lc", cmd], cwd=cwd,
+                                   capture_output=True, text=True, timeout=MAX_SECONDS)
+                log(f"DONE node={node} exit={p.returncode}")
+                self._send(200, {"exit": p.returncode, "stdout": p.stdout, "stderr": p.stderr})
+            except subprocess.TimeoutExpired:
+                log(f"TIMEOUT node={node}")
+                self._send(200, {"exit": 124, "stdout": "", "stderr": f"timed out after {MAX_SECONDS}s"})
 
     def log_message(self, *a):
         pass
@@ -89,11 +141,26 @@ class Handler(BaseHTTPRequestHandler):
 def main():
     CFG.mkdir(parents=True, exist_ok=True)
     srv = ThreadingHTTPServer((BIND, PORT), Handler)
-    log(f"listening on {BIND}:{PORT} (cwd={WORKDIR}, timeout={MAX_SECONDS}s)")
+    bar = "═" * 72
+    sys.stdout.write(
+        f"{DIM}{bar}{RST}\n"
+        f"{BOLD}hive-hostd — Mac approval console{RST}\n"
+        f"  listening : {BIND}:{PORT}    default cwd: {WORKDIR}\n"
+        f"  timeout   : {MAX_SECONDS}s per command\n"
+    )
+    if HAVE_TTY:
+        sys.stdout.write("  Every command a blessed node asks to run waits here for your y/N.\n"
+                         "  Ctrl-C to stop — nodes then can't run anything on the Mac.\n")
+    else:
+        sys.stdout.write(f"{RED}  WARNING: no terminal attached — every request will be DENIED (fail-closed).\n"
+                         f"  Run `hive hostd start` in a real foreground terminal to approve commands.{RST}\n")
+    sys.stdout.write(f"{DIM}{bar}{RST}\n")
+    sys.stdout.flush()
+    log(f"listening on {BIND}:{PORT} (cwd={WORKDIR}, timeout={MAX_SECONDS}s, tty={HAVE_TTY})")
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
-        pass
+        sys.stdout.write("\nhostd: stopped.\n")
 
 
 if __name__ == "__main__":

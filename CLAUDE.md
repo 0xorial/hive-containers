@@ -13,6 +13,10 @@ explicitly asks.
 
 - `hive <node> github on` creates a private GitHub repo `<owner>/<node>` as a
   side effect when the workspace has no origin — say so before running it.
+  `hive new <name> --github` is the one-shot form (scaffold, first commit,
+  repo, push) and carries the same side effect: same rule.
+- `hive code <node>` opens a VS Code window on the owner's Mac. Fine to run
+  when they asked for VS Code; say that you did.
 - Never push, and never use credentials found inside a node, without asking.
 - This checkout is what `hive up` runs. Test `bin/hive` changes with a
   throwaway node (`hive new <x> --no-dind`, then `hive rm <x> --purge` and
