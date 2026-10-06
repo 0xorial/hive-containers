@@ -397,6 +397,27 @@ cmd_new() {
     -e "HIVE_NAME=$name" -e "HIVE_PARENT=$parent"
     -v hive-shared:/shared -v "hive-claude-$name:/home/dev/.claude")
 
+  # HIVE_CLAUDE_ROOT (set only in terra's dev VM, terra-config #52): the node's ~/.claude is the
+  # folder <root>/nodes/<name> on a snapshotted dataset instead of the hive-claude-<name> volume,
+  # so removing or recreating the node keeps its sessions, memory and login (Timur, 2026-10-05:
+  # "i want my history preserved"). <root>/CLAUDE.md and <root>/user-memory, his user-wide
+  # rules, are mounted read-only on top: a node reads them and cannot change them.
+  if [ -n "${HIVE_CLAUDE_ROOT:-}" ]; then
+    local i
+    for i in "${!args[@]}"; do
+      if [ "${args[$i]}" = "hive-claude-$name:/home/dev/.claude" ]; then
+        args[$i]="$HIVE_CLAUDE_ROOT/nodes/$name:/home/dev/.claude"
+      fi
+    done
+    mkdir -p "$HIVE_CLAUDE_ROOT/nodes/$name"
+    if [ -f "$HIVE_CLAUDE_ROOT/CLAUDE.md" ]; then
+      args+=(-v "$HIVE_CLAUDE_ROOT/CLAUDE.md:/home/dev/.claude/CLAUDE.md:ro")
+    fi
+    if [ -d "$HIVE_CLAUDE_ROOT/user-memory" ]; then
+      args+=(-v "$HIVE_CLAUDE_ROOT/user-memory:/home/dev/.claude/user-memory:ro")
+    fi
+  fi
+
   # --dind: --privileged is creation-time; a dedicated volume for /var/lib/docker
   # gives the nested engine a real (ext4) fs so overlay2 works (no overlay-on-overlay)
   if [ "$dind" = 1 ]; then
@@ -423,6 +444,12 @@ cmd_new() {
     [ -e "$bind" ] || mkdir -p "$bind"
     [ "${HIVE_RECREATE:-}" = 1 ] || project=1
     args+=(-v "$bind:/workspace")
+    # HIVE_REAL_PATHS (terra's dev VM, #52): the project is mounted at its own path as well, so a
+    # session started there is stored under the same folder name as everywhere else on the VM and
+    # the desktop app groups it per project; hive's own steps keep using /workspace.
+    if [ "${HIVE_REAL_PATHS:-}" = 1 ] && [ "$bind" != /workspace ]; then
+      args+=(-v "$bind:$bind" -e "HIVE_PROJECT_DIR=$bind")
+    fi
   else
     # volume-backed nodes are projects too: a brand-new hive-ws volume gets the
     # same scaffold as a fresh --bind dir, so `github on` has a repo to wire.
@@ -443,6 +470,9 @@ cmd_new() {
   # git refuses "dubious" repos. ~/.gitconfig is container-fs (not a volume),
   # so recreates land here again and re-add it to a fresh file.
   docker exec -u dev "$PREFIX$name" git config --global --add safe.directory /workspace >/dev/null 2>&1 || true
+  if [ "${HIVE_REAL_PATHS:-}" = 1 ] && [ -n "$bind" ]; then
+    docker exec -u dev "$PREFIX$name" git config --global --add safe.directory "$bind" >/dev/null 2>&1 || true
+  fi
   if [ -f "$HOME/.ssh/hive_ed25519.pub" ]; then
     inject_ssh_key "$PREFIX$name" || note "warning: could not install ssh key in $name"
   fi
@@ -506,20 +536,28 @@ cmd_tree() {
   fi
 }
 
+# The folder a node's sessions start in: its project's own path when HIVE_REAL_PATHS mounted it
+# there (terra's dev VM, #52), else /workspace.
+node_dir() {
+  local d
+  d=$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$PREFIX$1" 2>/dev/null | sed -n 's/^HIVE_PROJECT_DIR=//p' || true)
+  echo "${d:-/workspace}"
+}
+
 cmd_sh() {
   local name=root
   if [ $# -gt 0 ]; then name=$1; shift; fi
   if [ $# -gt 0 ]; then
-    docker exec "$(tty_flags)" -u dev -w /workspace "$PREFIX$name" zsh -lc "$*"
+    docker exec "$(tty_flags)" -u dev -w "$(node_dir "$name")" "$PREFIX$name" zsh -lc "$*"
   else
-    docker exec "$(tty_flags)" -u dev -w /workspace "$PREFIX$name" zsh -l
+    docker exec "$(tty_flags)" -u dev -w "$(node_dir "$name")" "$PREFIX$name" zsh -l
   fi
 }
 
 cmd_claude() {
   if [ $# -lt 1 ]; then die "usage: hive claude <node> [claude args...]"; fi
   local name=$1; shift
-  docker exec "$(tty_flags)" -u dev -w /workspace "$PREFIX$name" claude "$@"
+  docker exec "$(tty_flags)" -u dev -w "$(node_dir "$name")" "$PREFIX$name" claude "$@"
 }
 
 # ---------------- per-node switches ----------------
