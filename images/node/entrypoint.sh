@@ -116,15 +116,23 @@ EOR
 )
   fi
 
+  # A node whose project hive also mounted at its own path (HIVE_PROJECT_DIR; terra's dev VM,
+  # terra-config #52/#53) starts its sessions there, and they are stored by that folder.
+  if [ -n "${HIVE_PROJECT_DIR:-}" ] && [ "$HIVE_PROJECT_DIR" != /workspace ]; then
+    workdir_line="- \`${HIVE_PROJECT_DIR}\` — your project folder and working directory (the same files are also mounted at \`/workspace\`)"
+  else
+    workdir_line="- \`/workspace\` — your working directory"
+  fi
+
   cat > /etc/claude-code/CLAUDE.md <<EOF
 # hive — where you are
 
-You are Claude Code running inside **${hive_name}**, one container in a *hive*: a tree of dev containers on a single host (a MacBook). The user reaches you through the Claude desktop app, \`hive claude ${hive_name}\`, or the Claude Code VS Code extension attached to this container.
+You are Claude Code running inside **${hive_name}**, one container in a *hive*: a tree of dev containers on a single host (the user's Mac, or the dev VM on their home server terra). The user reaches you through the Claude desktop app, \`hive claude ${hive_name}\`, or the Claude Code VS Code extension attached to this container.
 
 ## This container
 - Name: **${hive_name}**${hive_parent_line}
 - Role: **${hive_role}**
-- \`/workspace\` — your working directory
+${workdir_line}
 - \`/shared\` — a volume shared with every hive container (scratch space for handing files between containers)
 
 ## Permissions

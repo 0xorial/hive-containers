@@ -1116,11 +1116,14 @@ cmd_doctor() {
 # folder, the extension, and its bypass-permissions settings (machine-scoped in
 # VS Code, so they must live on the container side, not in Mac user settings).
 cmd_code() {
-  local node=${1:-} c dir cfg hex
+  local node=${1:-} c dir cfg hex folder
   if [ -z "$node" ]; then die "usage: hive code <node>"; fi
   c="$PREFIX$node"
   docker container inspect "$c" >/dev/null 2>&1 || die "no such node: $node"
   if [ "$(docker container inspect -f '{{.State.Running}}' "$c")" != true ]; then die "$node is not running"; fi
+  # the project's own path on terra's dev VM (HIVE_REAL_PATHS, #53), else /workspace: sessions
+  # started from VS Code are then stored with the project's other sessions
+  folder=$(node_dir "$node")
   command -v code >/dev/null 2>&1 || die "'code' not on PATH — VS Code: Shell Command: Install 'code' command in PATH"
   case "$(uname -s)" in
     Darwin) dir="$HOME/Library/Application Support/Code/User/globalStorage/ms-vscode-remote.remote-containers/nameConfigs" ;;
@@ -1129,9 +1132,9 @@ cmd_code() {
   cfg="$dir/$c.json"
   if [ ! -f "$cfg" ]; then
     mkdir -p "$dir"
-    cat > "$cfg" <<'EOF'
+    cat > "$cfg" <<EOF
 {
-  "workspaceFolder": "/workspace",
+  "workspaceFolder": "$folder",
   "remoteUser": "dev",
   "extensions": ["anthropic.claude-code"],
   "settings": {
@@ -1150,7 +1153,7 @@ EOF
     json="{\"containerName\":\"/$c\",\"settings\":{\"context\":\"$DOCKER_CONTEXT\"}}"
   fi
   hex=$(printf '%s' "$json" | od -An -tx1 | tr -d ' \n')
-  code --folder-uri "vscode-remote://attached-container+$hex/workspace"
+  code --folder-uri "vscode-remote://attached-container+$hex$folder"
 }
 
 cmd_devcontainer() {
