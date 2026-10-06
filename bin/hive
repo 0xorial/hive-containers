@@ -430,8 +430,8 @@ cmd_new() {
 
   # HIVE_CLAUDE_ROOT (set only in terra's dev VM, terra-config #52): the node's ~/.claude is the
   # folder <root>/nodes/<name> on a snapshotted dataset instead of the hive-claude-<name> volume,
-  # so removing or recreating the node keeps its sessions, memory and login (Timur, 2026-10-05:
-  # "i want my history preserved"). <root>/CLAUDE.md and <root>/user-memory, his user-wide
+  # so removing or recreating the node keeps its sessions, memory and login, which Timur
+  # wants preserved. <root>/CLAUDE.md and <root>/user-memory, his user-wide
   # rules, are mounted read-only on top: a node reads them and cannot change them.
   if [ -n "${HIVE_CLAUDE_ROOT:-}" ]; then
     local i
